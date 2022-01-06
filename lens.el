@@ -36,9 +36,12 @@
 
 Format of a chain: (chain (OVERLAYS...) TEXT PROPERTIES...)")
 
-(defun lens-create-chain ()
-  "Create a new lens chain."
-  (let ((chain (list 'chain nil nil)))
+(defun lens-create-chain (&rest props)
+  "Create a new lens chain.
+
+PROPS is a list of keyword-value pairs, which can include:
+:source -- A major mode or lens to serve as the parent lens"
+  (let ((chain `(chain nil nil . ,props)))
     (push chain lens-chains)
     chain))
 
@@ -126,18 +129,24 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   (overlay-get (lens-at pos) 'lens-chain))
 
 (defun lens-get (lens prop)
-  "Return the property PROP of the lens at point or LENS.
-
-If LENS is nil, use the lens at point."
+  "Return the property PROP of the lens at point or LENS."
   (setq lens (or lens (lens-at) (error "No lens at point")))
   (plist-get (overlay-get lens 'lens-props) prop))
 
-(defun lens-chain-get (chain prop)
-  "Return the property PROP of CHAIN.
+(defun lens-set (lens prop val)
+  "Set the value of PROP to VAL in LENS."
+  (setq lens (or lens (lens-at) (error "No lens at point")))
+  (overlay-put lens 'lens-props (plist-put (overlay-get lens 'lens-props) prop val)))
 
-If CHAIN is nil, use the chain at point."
+(defun lens-chain-get (chain prop)
+  "Return the property PROP of CHAIN."
   (setq chain (or chain (lens-chain-at) (error "No chain at point")))
   (plist-get (caddr chain) prop))
+
+(defun lens-chain-set (chain prop val)
+  "Set the value of PROP to VAL in CHAIN."
+  (setq chain (or chain (lens-chain-at) (error "No chain at point")))
+  (setf (cdddr chain) (plist-put (cdddr chain) prop val)))
 
 ;; Integration with emacs -----------------------------------------
 
