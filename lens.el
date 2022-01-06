@@ -81,7 +81,7 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   (let ((chain (overlay-get lens 'lens-chain)))
     (unless dont-remove
       (setf (cadr chain) (remove lens (cadr chain)))))
-  (when (lens-get :revert lens)
+  (when (lens-get lens :revert)
     (lens-set-text lens (overlay-get lens 'lens-original-text)))
   (delete-overlay lens))
 
@@ -125,13 +125,17 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   "Return the lens chain corresponding to the lens at point or POS."
   (overlay-get (lens-at pos) 'lens-chain))
 
-(defun lens-get (prop &optional lens)
-  "Return the property PROP of the lens at point or LENS."
+(defun lens-get (lens prop)
+  "Return the property PROP of the lens at point or LENS.
+
+If LENS is nil, use the lens at point."
   (setq lens (or lens (lens-at) (error "No lens at point")))
   (plist-get (overlay-get lens 'lens-props) prop))
 
-(defun lens-chain-get (prop &optional chain)
-  "Return the property PROP of the chain at point or CHAIN."
+(defun lens-chain-get (chain prop)
+  "Return the property PROP of CHAIN.
+
+If CHAIN is nil, use the chain at point."
   (setq chain (or chain (lens-chain-at) (error "No chain at point")))
   (plist-get (caddr chain) prop))
 
@@ -141,14 +145,14 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   "Function run before saving a buffer."
   (let ((os (overlays-in (point-min) (point-max))))
     (dolist (o os)
-      (when (lens-get :revert o)
+      (when (lens-get o :revert)
         (lens-set-text o (overlay-get o 'lens-original-text))))))
 
 (defun lens-after-save-function ()
   "Function run after saving a buffer."
   (let ((os (overlays-in (point-min) (point-max))))
     (dolist (o os)
-      (when (lens-get :revert o)
+      (when (lens-get o :revert)
         (lens-set-text o (caddr (overlay-get o 'lens-chain)))))))
 
 (add-hook 'before-save-hook 'lens-before-save-function)
