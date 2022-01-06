@@ -126,7 +126,8 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 (defun lens-chain-at (&optional pos)
   "Return the lens chain corresponding to the lens at point or POS."
-  (overlay-get (lens-at pos) 'lens-chain))
+  (when-let ((lens (lens-at pos)))
+    (overlay-get lens 'lens-chain)))
 
 (defun lens-get (lens prop)
   "Return the property PROP of the lens at point or LENS."
@@ -166,6 +167,37 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 (add-hook 'before-save-hook 'lens-before-save-function)
 (add-hook 'after-save-hook 'lens-after-save-function)
+
+;; Highlighting the current chain ---------------------------------
+
+(defvar lens-current-chain nil
+  "The chain of the lens the cursor is currently inside, if any.")
+
+(defface lens-highlight '((default (:inherit highlight)))
+  "Face to highlight all lenses in the current chain.")
+
+(define-minor-mode lens-highlight-mode
+  "Highlight lenses in the same chain as the current lens."
+  :global t
+  :init-value nil
+  (if lens-highlight-mode
+      (add-hook 'post-command-hook 'lens-update-highlight)
+    (lens-set-chain-face lens-current-chain nil)
+    (remove-hook 'post-command-hook 'lens-update-highlight)))
+
+(defun lens-set-chain-face (chain face)
+  "Set the `face` property of all lenses in CHAIN to FACE."
+  (dolist (lens (cadr chain))
+    (overlay-put lens 'face face)))
+
+(defun lens-update-highlight ()
+  "Update highlighting for `lens-highlight-mode`."
+  (when lens-highlight-mode
+    (let ((chain (lens-chain-at)))
+      (unless (eq chain lens-current-chain)
+        (when lens-current-chain (lens-set-chain-face lens-current-chain nil))
+        (when chain (lens-set-chain-face chain 'lens-highlight))
+        (setq lens-current-chain chain)))))
 
 (provide 'lens)
 
