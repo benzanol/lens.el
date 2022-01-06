@@ -58,7 +58,8 @@ Lens will be a new lens from BEG to END in the current buffer."
       (error "Another lens exists in the specified area")))
   (let ((o (make-overlay beg end nil nil t)))
     (push o (cadr chain))
-    (overlay-put o 'lens chain)))
+    (overlay-put o 'lens chain)
+    (overlay-put o 'modification-hooks '(lens-modification-hook))))
 
 (defun lens-delete (lens &optional dont-remove)
   "Delete LENS and remove it from its lens chain.
@@ -71,22 +72,30 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 ;; Functions for using lenses -------------------------------------
 
-(defvar lens-inhibit-update nil
-  "Used to avoid infinite loops when updating a chain of lenses.")
-
 (defun lens-update-chain (chain text &optional skip)
   "Update each lens in CHAIN to show the text TEXT.
 If SKIP is specified, it is a single lens in the chain that will
 not be updated, to avoid rewriting the current lens."
-  (unless lens-inhibit-update
-    (let ((lens-inhibit-update t))
-      (dolist (lens (cadr chain))
-        (unless (eq lens skip)
-          (with-current-buffer (overlay-buffer lens)
-            (save-excursion
-              (goto-char (overlay-start lens))
-              (delete-region (point) (overlay-end lens))
-              (insert text))))))))
+  (let ((inhibit-modification-hooks t))
+    (dolist (lens (cadr chain))
+      (unless (eq lens skip)
+        (with-current-buffer (overlay-buffer lens)
+          (save-excursion
+            (goto-char (overlay-start lens))
+            (delete-region (point) (overlay-end lens))
+            (insert text)))))))
+
+(defun lens-modification-hook (o after beg end &optional len)
+  "Function called before and after modifying a lens.
+
+O, AFTER, BEG, END, and LEN are the arguments passed by the
+modification hook."
+  (when after
+    (with-current-buffer (overlay-buffer o)
+      (lens-update-chain
+       (overlay-get o 'lens)
+       (buffer-substring (overlay-start o) (overlay-end o))
+       o))))
 
 (provide 'lens)
 
