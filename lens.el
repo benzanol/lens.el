@@ -38,7 +38,7 @@ Format of a chain: (chain (OVERLAYS...) TEXT PROPERTIES...)")
 
 (defun lens-create-chain ()
   "Create a new lens chain."
-  (let ((chain (list 'chain nil)))
+  (let ((chain (list 'chain nil nil)))
     (push chain lens-chains)
     chain))
 
@@ -67,7 +67,10 @@ The remaining arguments are keyword-value pairs, which can include:
     (let ((update-func 'lens-modification-hook))
       (overlay-put o 'modification-hooks (list update-func))
       (overlay-put o 'insert-in-front-hooks (list update-func))
-      (overlay-put o 'insert-behind-hooks (list update-func)))))
+      (overlay-put o 'insert-behind-hooks (list update-func)))
+    (if (caddr chain) (lens-set-text o (caddr chain))
+      (setf (caddr chain) (buffer-substring beg end)))
+    o))
 
 (defun lens-delete (lens &optional dont-remove)
   "Delete LENS and remove it from its lens chain.
@@ -80,30 +83,29 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 ;; Functions for using lenses -------------------------------------
 
-(defun lens-update-chain (chain text &optional skip)
-  "Update each lens in CHAIN to show the text TEXT.
-If SKIP is specified, it is a single lens in the chain that will
-not be updated, to avoid rewriting the current lens."
-  (let ((inhibit-modification-hooks t))
-    (dolist (lens (cadr chain))
-      (unless (eq lens skip)
-        (with-current-buffer (overlay-buffer lens)
-          (save-excursion
-            (goto-char (overlay-start lens))
-            (delete-region (point) (overlay-end lens))
-            (insert text)))))))
+(defun lens-set-text (lens text)
+  "Update LENS to display TEXT."
+  (let ((inhibit-modification-hooks t)
+        (start (overlay-start lens)))
+    (with-current-buffer (overlay-buffer lens)
+      (save-excursion
+        (delete-region start (overlay-end lens))
+        (goto-char start) (insert text)
+        (move-overlay lens start (+ start (length text)))))))
 
 (defun lens-modification-hook (&rest args)
   "Function called whenever an overlay is updated with ARGS."
-  (let ((o (car args)) (after (cadr args)))
-    (when after
-      (with-current-buffer (overlay-buffer o)
-        (lens-update-chain
-         (overlay-get o 'lens-chain)
-         (buffer-substring (overlay-start o) (overlay-end o))
-         o)))))
+  ;; Only run AFTER updating the overlay, not before
+  (when (cadr args)
+    (let* ((o (car args))
+           (text (with-current-buffer (overlay-buffer o)
+                   (buffer-substring (overlay-start o) (overlay-end o)))))
+      (dolist (lens (cadr (overlay-get o 'lens-chain)))
+        (unless (eq lens o)
+          (lens-set-text lens text))))))
 
 ;; Helpful functions ----------------------------------------------
+
 (defun lens-at (&optional pos)
   "Return the lens at the current point, or at POS if non-nil."
   (unless pos (setq pos (point)))
