@@ -23,44 +23,59 @@
 
 ;; A 'lens' is a region of text which is linked to other lenses
 ;; displaying the same text, so that a change to one lens updates
-;; all other lenses that it is linked to. Each lens is marked by an
+;; all other lenses that it is linked to.  Each lens is marked by an
 ;; overlay surrounding the region taken up by the lens.
 ;; A 'chain' is a group of lenses that are linked to each other
 
 ;;; Code:
+
+;; Creating/deleting lenses and lens chains -----------------------
 
 (defvar lens-chains nil
   "Global list of all active chains.
 
 Format of a chain: (chain (OVERLAYS...) TEXT PROPERTIES...)")
 
-(defun lens-create-chain (&rest lenses)
-  "Create a new lens chain.")
+(defun lens-create-chain ()
+  "Create a new lens chain."
+  (let ((chain (list 'chain nil)))
+    (push chain lens-chains)
+    chain))
 
 (defun lens-delete-chain (chain)
-  "Delete an entire lens chain.")
+  "Delete the lens chain CHAIN and every lens in it."
+  (dolist (lens (cadr chain))
+    (lens-delete-lens lens t))
+  (setq lens-chains (remove chain lens-chains)))
 
-(defun lens-create-lens (chain beg end &optional buffer)
-  "Add a lens to an existing lens chain."
+(defun lens-create (chain beg end)
+  "Add a new lens to the existing lens chain CHAIN.
+
+Lens will be a new lens from BEG to END in the current buffer."
   ;; Make sure there are no overlapping lenses
   (dolist (overlay (overlays-in beg end))
     (when (overlay-get overlay 'lens)
-      (error "Another lens exists in the specified area.")))
-
-  (let ((o (make-overlay beg end nil t)))
+      (error "Another lens exists in the specified area")))
+  (let ((o (make-overlay beg end nil nil t)))
     (push o (cadr chain))
     (overlay-put o 'lens chain)))
 
-(defun lens-delete-lens (lens)
-  "Remove a lens from a lens chain.")
+(defun lens-delete (lens &optional dont-remove)
+  "Delete LENS and remove it from its lens chain.
+
+If DONT-REMOVE is non-nil, don't remove the lens from its chain."
+  (let ((chain (overlay-get lens 'lens)))
+    (unless dont-remove
+      (setf (cadr chain) (remove lens (cadr chain)))))
+  (delete-overlay lens))
+
+;; Functions for using lenses -------------------------------------
 
 (defvar lens-inhibit-update nil
   "Used to avoid infinite loops when updating a chain of lenses.")
 
-
-
 (defun lens-update-chain (chain text &optional skip)
-  "Update each lens in a cahin to contain the specified text.
+  "Update each lens in CHAIN to show the text TEXT.
 If SKIP is specified, it is a single lens in the chain that will
 not be updated, to avoid rewriting the current lens."
   (unless lens-inhibit-update
@@ -75,4 +90,4 @@ not be updated, to avoid rewriting the current lens."
 
 (provide 'lens)
 
-;;; integrate.el ends here
+;;; lens.el ends here
