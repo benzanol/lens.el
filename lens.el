@@ -72,13 +72,17 @@ The remaining arguments are keyword-value pairs, which can include:
       (setf (caddr chain) (buffer-substring beg end)))
     o))
 
-(defun lens-delete (lens &optional dont-remove)
+(defun lens-delete (&optional lens dont-remove)
   "Delete LENS and remove it from its lens chain.
 
 If DONT-REMOVE is non-nil, don't remove the lens from its chain."
+  (interactive)
+  (unless lens (setq lens (lens-at)))
   (let ((chain (overlay-get lens 'lens-chain)))
     (unless dont-remove
       (setf (cadr chain) (remove lens (cadr chain)))))
+  (when (lens-get :revert lens)
+    (lens-set-text lens (overlay-get lens 'lens-original-text)))
   (delete-overlay lens))
 
 ;; Functions for using lenses -------------------------------------
@@ -99,8 +103,10 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   (when (cadr args)
     (let* ((o (car args))
            (text (with-current-buffer (overlay-buffer o)
-                   (buffer-substring (overlay-start o) (overlay-end o)))))
-      (dolist (lens (cadr (overlay-get o 'lens-chain)))
+                   (buffer-substring (overlay-start o) (overlay-end o))))
+           (chain (overlay-get o 'lens-chain)))
+      (setf (caddr chain) text)
+      (dolist (lens (cadr chain))
         (unless (eq lens o)
           (lens-set-text lens text))))))
 
@@ -128,6 +134,25 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   "Return the property PROP of the chain at point or CHAIN."
   (setq chain (or chain (lens-chain-at) (error "No chain at point")))
   (plist-get (caddr chain) prop))
+
+;; Integration with emacs -----------------------------------------
+
+(defun lens-before-save-function ()
+  "Function run before saving a buffer."
+  (let ((os (overlays-in (point-min) (point-max))))
+    (dolist (o os)
+      (when (lens-get :revert o)
+        (lens-set-text o (overlay-get o 'lens-original-text))))))
+
+(defun lens-after-save-function ()
+  "Function run after saving a buffer."
+  (let ((os (overlays-in (point-min) (point-max))))
+    (dolist (o os)
+      (when (lens-get :revert o)
+        (lens-set-text o (caddr (overlay-get o 'lens-chain)))))))
+
+(add-hook 'before-save-hook 'lens-before-save-function)
+(add-hook 'after-save-hook 'lens-after-save-function)
 
 (provide 'lens)
 
