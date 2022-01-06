@@ -48,17 +48,22 @@ Format of a chain: (chain (OVERLAYS...) TEXT PROPERTIES...)")
     (lens-delete lens t))
   (setq lens-chains (remove chain lens-chains)))
 
-(defun lens-create (chain beg end)
-  "Add a new lens to the existing lens chain CHAIN.
+(defun lens-create (chain beg end &rest props)
+  "Add a new lens from BEG to END to the existing lens chain CHAIN.
 
-Lens will be a new lens from BEG to END in the current buffer."
+The remaining arguments are keyword-value pairs, which can include:
+:revert -- Save the buffer with the original text, not lens text"
+
   ;; Make sure there are no overlapping lenses
   (dolist (overlay (overlays-in beg end))
     (when (overlay-get overlay 'lens)
       (error "Another lens exists in the specified area")))
   (let ((o (make-overlay beg end nil nil t)))
     (push o (cadr chain))
-    (overlay-put o 'lens chain)
+    (overlay-put o 'lens t)
+    (overlay-put o 'lens-chain chain)
+    (overlay-put o 'lens-props props)
+    (overlay-put o 'lens-original-text (buffer-substring beg end))
     (let ((update-func 'lens-modification-hook))
       (overlay-put o 'modification-hooks (list update-func))
       (overlay-put o 'insert-in-front-hooks (list update-func))
@@ -68,7 +73,7 @@ Lens will be a new lens from BEG to END in the current buffer."
   "Delete LENS and remove it from its lens chain.
 
 If DONT-REMOVE is non-nil, don't remove the lens from its chain."
-  (let ((chain (overlay-get lens 'lens)))
+  (let ((chain (overlay-get lens 'lens-chain)))
     (unless dont-remove
       (setf (cadr chain) (remove lens (cadr chain)))))
   (delete-overlay lens))
@@ -88,17 +93,15 @@ not be updated, to avoid rewriting the current lens."
             (delete-region (point) (overlay-end lens))
             (insert text)))))))
 
-(defun lens-modification-hook (o after beg end &optional len)
-  "Function called before and after modifying a lens.
-
-O, AFTER, BEG, END, and LEN are the arguments passed by the
-modification hook."
-  (when after
-    (with-current-buffer (overlay-buffer o)
-      (lens-update-chain
-       (overlay-get o 'lens)
-       (buffer-substring (overlay-start o) (overlay-end o))
-       o))))
+(defun lens-modification-hook (&rest args)
+  "Function called whenever an overlay is updated with ARGS."
+  (let ((o (car args)) (after (cadr args)))
+    (when after
+      (with-current-buffer (overlay-buffer o)
+        (lens-update-chain
+         (overlay-get o 'lens-chain)
+         (buffer-substring (overlay-start o) (overlay-end o))
+         o)))))
 
 ;; Helpful functions ----------------------------------------------
 (defun lens-at (&optional pos)
@@ -112,12 +115,12 @@ modification hook."
 
 (defun lens-chain-at (&optional pos)
   "Return the lens chain corresponding to the lens at point or POS."
-  (overlay-get (lens-at pos) 'lens))
+  (overlay-get (lens-at pos) 'lens-chain))
 
 (defun lens-get (prop &optional lens)
   "Return the property PROP of the lens at point or LENS."
   (setq lens (or lens (lens-at) (error "No lens at point")))
-  (overlay-get lens prop))
+  (plist-get (overlay-get lens 'lens-props) prop))
 
 (defun lens-chain-get (prop &optional chain)
   "Return the property PROP of the chain at point or CHAIN."
