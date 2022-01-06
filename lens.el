@@ -45,7 +45,7 @@ Format of a chain: (chain (OVERLAYS...) TEXT PROPERTIES...)")
 (defun lens-delete-chain (chain)
   "Delete the lens chain CHAIN and every lens in it."
   (dolist (lens (cadr chain))
-    (lens-delete-lens lens t))
+    (lens-delete lens t))
   (setq lens-chains (remove chain lens-chains)))
 
 (defun lens-create (chain beg end)
@@ -59,7 +59,10 @@ Lens will be a new lens from BEG to END in the current buffer."
   (let ((o (make-overlay beg end nil nil t)))
     (push o (cadr chain))
     (overlay-put o 'lens chain)
-    (overlay-put o 'modification-hooks '(lens-modification-hook))))
+    (let ((update-func 'lens-modification-hook))
+      (overlay-put o 'modification-hooks (list update-func))
+      (overlay-put o 'insert-in-front-hooks (list update-func))
+      (overlay-put o 'insert-behind-hooks (list update-func)))))
 
 (defun lens-delete (lens &optional dont-remove)
   "Delete LENS and remove it from its lens chain.
@@ -96,6 +99,30 @@ modification hook."
        (overlay-get o 'lens)
        (buffer-substring (overlay-start o) (overlay-end o))
        o))))
+
+;; Helpful functions ----------------------------------------------
+(defun lens-at (&optional pos)
+  "Return the lens at the current point, or at POS if non-nil."
+  (unless pos (setq pos (point)))
+  (let ((overlays (overlays-at pos)) lens)
+    (while (and overlays (null lens))
+      (if (overlay-get (car overlays) 'lens)
+          (setq lens (pop overlays)) (pop overlays)))
+    lens))
+
+(defun lens-chain-at (&optional pos)
+  "Return the lens chain corresponding to the lens at point or POS."
+  (overlay-get (lens-at pos) 'lens))
+
+(defun lens-get (prop &optional lens)
+  "Return the property PROP of the lens at point or LENS."
+  (setq lens (or lens (lens-at) (error "No lens at point")))
+  (overlay-get lens prop))
+
+(defun lens-chain-get (prop &optional chain)
+  "Return the property PROP of the chain at point or CHAIN."
+  (setq chain (or chain (lens-chain-at) (error "No chain at point")))
+  (plist-get (caddr chain) prop))
 
 (provide 'lens)
 
