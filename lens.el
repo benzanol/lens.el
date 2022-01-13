@@ -273,10 +273,21 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 (defun lens--indirect-edit-command-loop ()
   ;; Move cursor to correct location
-  (let ((pos (- (point) (overlay-start lens-indirect-edit-viewed))))
+  (let ((pos (- (point) (overlay-start lens-indirect-edit-viewed)))
+        (orig-buf (current-buffer)))
     (with-current-buffer (overlay-buffer lens-indirect-edit-source)
       (goto-char (+ (overlay-start lens-indirect-edit-source) pos))
-      (call-interactively (key-binding (read-key-sequence "KEY: ")))
+
+      (let* ((key (read-key-sequence "KEY: "))
+             (last-key (aref key (1- (length key))))
+             (last-input-event last-key)
+             (last-command-event last-key))
+        (call-interactively (key-binding key))
+
+        (let ((lens-ct cursor-type))
+          (with-current-buffer orig-buf
+            (setq cursor-type lens-ct))))
+      
       (setq pos (- (point) (overlay-start lens-indirect-edit-source))))
     (goto-char (+ (overlay-start lens-indirect-edit-viewed) pos))))
 
