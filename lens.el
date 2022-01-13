@@ -100,7 +100,7 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
           (delete-region start (overlay-end lens))
           (goto-char start) (insert text)
           (move-overlay lens start (+ start (length text))))))))
-j
+
 (defun lens-modification-hook (&rest args)
   "Function called whenever an overlay is updated with ARGS."
   ;; Only run AFTER updating the overlay, not before
@@ -285,16 +285,25 @@ j
 
 (defun lens-indirect-edit-post-command ()
   (lens-modification-hook lens-indirect-edit-source t)
-  (if (eq (current-buffer) (overlay-buffer lens-indirect-edit-source))
+  (if (or (eq (current-buffer) (overlay-buffer lens-indirect-edit-source))
+          (eq (current-buffer) (overlay-buffer lens-indirect-edit-viewed)))
       
       (let ((pos (- (point) (overlay-start lens-indirect-edit-source)))
-            (face (and buffer-face-mode buffer-face-mode-face)))
+            (face (and buffer-face-mode buffer-face-mode-face))
+            (ct cursor-type))
+
+        ;; Exit indirect edit if the cursor position is outside of the lens
+        (when (or (> pos (overlay-end lens-indirect-edit-source))
+                  (< pos (overlay-start lens-indirect-edit-source)))
+          (lens-exit-indirect-edit))
         
         (set-buffer (overlay-buffer lens-indirect-edit-viewed))
+
+        ;; Update the cursor position in the original lens
         (goto-char (+ (overlay-start lens-indirect-edit-viewed) pos))
-        
-        (when (or (> pos (- (overlay-end) (overlay-start))) (< pos 0))
-          (lens-exit-indirect-edit)))
+
+        ;; Update the cursor type
+        (setq cursor-type ct))
     
     (lens-exit-indirect-edit)))
 
