@@ -62,7 +62,7 @@ The remaining arguments are keyword-value pairs, which can include:
   (dolist (overlay (overlays-in beg end))
     (when (overlay-get overlay 'lens)
       (error "Another lens exists in the specified area")))
-  (let ((o (make-overlay beg end nil nil t)))
+  (let ((o (make-overlay beg end nil t nil)))
     (push o (cadr chain))
     (overlay-put o 'lens t)
     (overlay-put o 'lens-chain chain)
@@ -236,6 +236,10 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 (defvar lens-indirect-edit-viewed nil
   "Lens facing the user during the indirect edit.")
 
+(defun lens-chain-set-source (chain lens)
+  (interactive (list (lens-chain) (lens-at)))
+  (lens-chain-set chain :source lens))
+
 (defun lens-enter-indirect-edit (&optional viewed source)
   "Enter indirect editting mode."
   (interactive)
@@ -254,13 +258,18 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
         (insert "\n\n")
         (setq source (lens-create (lens-chain viewed) 1 1)))
     (unless (overlayp source) (error "Source lens is neither a symbol nor overlay")))
-  
+
+  ;; Set global variables
   (setq lens-indirect-edit-source source
         lens-indirect-edit-viewed viewed
         lens-indirect-edit-mode t)
 
+  ;; Add functions to the pre and post command hooks
   (add-hook 'pre-command-hook 'lens-indirect-edit-pre-command)
   (add-hook 'post-command-hook 'lens-indirect-edit-post-command)
+
+  ;; Run the pre command hook to get the source lens to match the current lens
+  (lens-indirect-edit-pre-command)
 
   (message "Entering indirect edit."))
 
@@ -269,10 +278,12 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
   (setq lens-indirect-edit-source nil
         lens-indirect-edit-viewed nil
         lens-indirect-edit-mode nil)
-  
+
+  ;; If a temporary buffer was created, delete it
   (when (get-buffer " *indirect-edit*")
     (kill-buffer " *indirect-edit*"))
-  
+
+  ;; Remove hooks
   (remove-hook 'pre-command-hook 'lens-indirect-edit-pre-command)
   (remove-hook 'post-command-hook 'lens-indirect-edit-post-command)
   
@@ -285,10 +296,10 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 (defun lens-indirect-edit-post-command ()
   (lens-modification-hook lens-indirect-edit-source t)
-  (if (or (eq (current-buffer) (overlay-buffer lens-indirect-edit-source))
-          (eq (current-buffer) (overlay-buffer lens-indirect-edit-viewed)))
+  (if (eq (current-buffer) (overlay-buffer lens-indirect-edit-source))
       
-      (let ((pos (- (point) (overlay-start lens-indirect-edit-source)))
+      (let ((pos (with-current-buffer (overlay-buffer lens-indirect-edit-source)
+                   (- (point) (overlay-start lens-indirect-edit-source))))
             (face (and buffer-face-mode buffer-face-mode-face))
             (ct cursor-type))
 
