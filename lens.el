@@ -29,7 +29,7 @@
 
 ;;; Code:
 
-;; Creating/deleting lenses and lens chains -----------------------
+;;; Creating/deleting lenses and lens chains ----------------------
 
 (defvar lens-chains nil
   "Global list of all active chains.
@@ -47,6 +47,7 @@ PROPS is a list of keyword-value pairs, which can include:
 
 (defun lens-delete-chain (chain)
   "Delete the lens chain CHAIN and every lens in it."
+  (interactive (list (lens-chain)))
   (dolist (lens (cadr chain))
     (lens-delete lens t))
   (setq lens-chains (remove chain lens-chains)))
@@ -75,12 +76,11 @@ The remaining arguments are keyword-value pairs, which can include:
       (setf (caddr chain) (buffer-substring beg end)))
     o))
 
-(defun lens-delete (&optional lens dont-remove)
+(defun lens-delete (lens &optional dont-remove)
   "Delete LENS and remove it from its lens chain.
 
 If DONT-REMOVE is non-nil, don't remove the lens from its chain."
-  (interactive)
-  (unless lens (setq lens (lens-at)))
+  (interactive (list (lens-at)))
   (let ((chain (overlay-get lens 'lens-chain)))
     (unless dont-remove
       (setf (cadr chain) (remove lens (cadr chain)))))
@@ -88,18 +88,19 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
     (lens-set-text lens (overlay-get lens 'lens-original-text)))
   (delete-overlay lens))
 
-;; Functions for using lenses -------------------------------------
+;;; Functions for using lenses ------------------------------------
 
 (defun lens-set-text (lens text)
   "Update LENS to display TEXT."
   (let ((inhibit-modification-hooks t)
         (start (overlay-start lens)))
-    (with-current-buffer (overlay-buffer lens)
-      (save-excursion
-        (delete-region start (overlay-end lens))
-        (goto-char start) (insert text)
-        (move-overlay lens start (+ start (length text)))))))
-
+    (when (overlay-buffer lens)
+      (with-current-buffer (overlay-buffer lens)
+        (save-excursion
+          (delete-region start (overlay-end lens))
+          (goto-char start) (insert text)
+          (move-overlay lens start (+ start (length text))))))))
+j
 (defun lens-modification-hook (&rest args)
   "Function called whenever an overlay is updated with ARGS."
   ;; Only run AFTER updating the overlay, not before
@@ -113,7 +114,7 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
         (unless (eq lens o)
           (lens-set-text lens text))))))
 
-;; Helpful functions ----------------------------------------------
+;;; Helpful functions ---------------------------------------------
 
 (defun lens-at (&optional pos)
   "Return the lens at the current point, or at POS if non-nil."
@@ -124,9 +125,9 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
           (setq lens (pop overlays)) (pop overlays)))
     lens))
 
-(defun lens-chain-at (&optional pos)
-  "Return the lens chain corresponding to the lens at point or POS."
-  (when-let ((lens (lens-at pos)))
+(defun lens-chain (&optional lens)
+  "Return the lens chain containing LENS or the lens at point."
+  (when-let ((lens (or lens (lens-at))))
     (overlay-get lens 'lens-chain)))
 
 (defun lens-get (lens prop)
@@ -141,15 +142,15 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 
 (defun lens-chain-get (chain prop)
   "Return the property PROP of CHAIN."
-  (setq chain (or chain (lens-chain-at) (error "No chain at point")))
-  (plist-get (caddr chain) prop))
+  (setq chain (or chain (lens-chain) (error "No chain at point")))
+  (plist-get (cdddr chain) prop))
 
 (defun lens-chain-set (chain prop val)
   "Set the value of PROP to VAL in CHAIN."
-  (setq chain (or chain (lens-chain-at) (error "No chain at point")))
+  (setq chain (or chain (lens-chain) (error "No chain at point")))
   (setf (cdddr chain) (plist-put (cdddr chain) prop val)))
 
-;; Integration with emacs -----------------------------------------
+;;; Integration with emacs ----------------------------------------
 
 (defun lens-before-save-function ()
   "Function run before saving a buffer."
@@ -168,7 +169,7 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 (add-hook 'before-save-hook 'lens-before-save-function)
 (add-hook 'after-save-hook 'lens-after-save-function)
 
-;; Highlighting the current chain ---------------------------------
+;;; Highlighting the current chain --------------------------------
 
 (defvar lens-current-chain nil
   "The chain of the lens the cursor is currently inside, if any.")
@@ -193,11 +194,109 @@ If DONT-REMOVE is non-nil, don't remove the lens from its chain."
 (defun lens-update-highlight ()
   "Update highlighting for `lens-highlight-mode`."
   (when lens-highlight-mode
-    (let ((chain (lens-chain-at)))
+    (let ((chain (lens-chain)))
       (unless (eq chain lens-current-chain)
         (when lens-current-chain (lens-set-chain-face lens-current-chain nil))
         (when chain (lens-set-chain-face chain 'lens-highlight))
         (setq lens-current-chain chain)))))
+
+;;; Convenient user facing interactive functions ------------------
+
+(defvar lens-clone-recursive-edit nil
+  "Non-nil if currently in a lens-clone recursive edit session.")
+
+(defun lens-clone ()
+  "Create a chain from the current region/lens to some location."
+  (interactive)
+  (if lens-clone-recursive-edit
+      (progn (setq lens-clone-recursive-edit nil)
+             (exit-recursive-edit))
+    (let (chain)
+      (if mark-active
+          (progn (setq chain (lens-create-chain))
+                 (lens-create chain (mark) (point)))
+        (setq chain (lens-chain))
+        (unless chain (error "No lens at point")))
+
+      (setq lens-clone-recursive-edit t)
+      (message "Navigate to the location you wish to create the clone, and run `lens-clone` again.")
+      (recursive-edit)
+      (setq lens-clone-recursive-edit nil)
+
+      (lens-create chain (if mark-active (mark) (point)) (point)))))
+
+;;; Indirect editing ----------------------------------------------
+
+(defvar lens-indirect-edit-mode nil
+  "Non-nil if an indirect edit is in progress.")
+
+(defvar lens-indirect-edit-source nil
+  "Source lens for the ongoing indirect edit.")
+
+(defvar lens-indirect-edit-viewed nil
+  "Lens facing the user during the indirect edit.")
+
+(defun lens-enter-indirect-edit (&optional viewed source)
+  "Enter indirect editting mode."
+  (interactive)
+  ;; Can't enter multiple indirect edit sessions at once
+  (when lens-indirect-edit-mode (error "An indirect edit is already in progress"))
+  
+  ;; If viewed or source is not specified, use the lens at point
+  (setq viewed (or viewed (lens-at) (error "No lens at point")))
+  (setq source (or source (lens-chain-get (or (lens-chain) (error "No lens at point")) :source)
+                   (error "Lens chain at point has no specified `:source` property")))
+
+  ;; If source is a symbol or form, create a buffer with the specified major mode
+  (if (symbolp source)
+      (with-current-buffer (generate-buffer " *indirect-edit*")
+        (funcall source)
+        (insert "\n\n")
+        (setq source (lens-create (lens-chain viewed) 1 1)))
+    (unless (overlayp source) (error "Source lens is neither a symbol nor overlay")))
+  
+  (setq lens-indirect-edit-source source
+        lens-indirect-edit-viewed viewed
+        lens-indirect-edit-mode t)
+
+  (add-hook 'pre-command-hook 'lens-indirect-edit-pre-command)
+  (add-hook 'post-command-hook 'lens-indirect-edit-post-command)
+
+  (message "Entering indirect edit."))
+
+(defun lens-exit-indirect-edit ()
+  (interactive)
+  (setq lens-indirect-edit-source nil
+        lens-indirect-edit-viewed nil
+        lens-indirect-edit-mode nil)
+  
+  (when (get-buffer " *indirect-edit*")
+    (kill-buffer " *indirect-edit*"))
+  
+  (remove-hook 'pre-command-hook 'lens-indirect-edit-pre-command)
+  (remove-hook 'post-command-hook 'lens-indirect-edit-post-command)
+  
+  (message "Exiting indirect edit."))
+
+(defun lens-indirect-edit-pre-command ()
+  (let ((pos (- (point) (overlay-start lens-indirect-edit-viewed))))
+    (set-buffer (overlay-buffer lens-indirect-edit-source))
+    (goto-char (+ (overlay-start lens-indirect-edit-source) pos))))
+
+(defun lens-indirect-edit-post-command ()
+  (lens-modification-hook lens-indirect-edit-source t)
+  (if (eq (current-buffer) (overlay-buffer lens-indirect-edit-source))
+      
+      (let ((pos (- (point) (overlay-start lens-indirect-edit-source)))
+            (face (and buffer-face-mode buffer-face-mode-face)))
+        
+        (set-buffer (overlay-buffer lens-indirect-edit-viewed))
+        (goto-char (+ (overlay-start lens-indirect-edit-viewed) pos))
+        
+        (when (or (> pos (- (overlay-end) (overlay-start))) (< pos 0))
+          (lens-exit-indirect-edit)))
+    
+    (lens-exit-indirect-edit)))
 
 (provide 'lens)
 
