@@ -2,8 +2,10 @@
 
 (require 'f)
 (require 'dash)
+(require 'org)
+(require 'text-property-search)
 
-(defvar lens-catch-display-errors nil)
+(defvar lens-catch-display-errors t)
 
 
 ;;; Utilities
@@ -32,6 +34,11 @@
       (put sym (pop props) (pop props)))
     sym))
 
+(defun lens--make-sticky (str &optional beg end)
+  (put-text-property 0 1 'front-sticky beg str)
+  (put-text-property (1- (length str)) (length str) 'rear-nonsticky (not end) str)
+  str)
+
 
 ;;;; Dealing with Regions
 
@@ -47,9 +54,9 @@
 (defun lens--region-at-point (beg-prop end-prop)
   (let* ((start (point))
          (hb nil) (he nil)
-         (pred (lambda (n val)
+         (pred (lambda (_nil val)
                  (and val
-                      (setq he (previous-single-property-change (point) beg-prop))
+                      (setq he (previous-single-property-change (1+ (point)) beg-prop))
                       (setq hb (or (previous-single-property-change he beg-prop) (point-min)))
                       (<= hb start)
                       (eq (get-text-property hb beg-prop) val))))
@@ -70,17 +77,22 @@
 ;;; Lens Lifecycle
 ;;;; Creating
 
-(defun lens--generate-insert-text (lens)
-  (let* ((fn (plist-get (get (car lens) :display) :insert))
-         (inside (condition-case err (funcall fn (car lens) (copy-tree (caddr lens)))
-                   (error (propertize (format "%s" err) 'face 'error))))
+(defun lens--generate-headers (lens)
+  (let* ((rand (format "%05d" (random 99999)))
          (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
-         (h-text (format":LENS-%s:" (replace-regexp-in-string "[^A-Za-z0-9-_]" "-" (or title ""))))
-         (h (propertize h-text 'lens-begin lens 'read-only t))
-         (f (propertize ":END:" 'lens-end lens 'read-only t)))
-    (put-text-property (- (length h) 1) (length h) 'rear-nonsticky t h)
-    (put-text-property (- (length f) 1) (length f) 'rear-nonsticky t f)
-    (concat h inside f)))
+         (title-str (replace-regexp-in-string "[^A-Za-z0-9-_]" "-" (or title "")))
+         (h-text (format ":LENS-%s-%s:" title-str rand))
+         (h (lens--make-sticky (propertize h-text 'lens-begin lens 'read-only t)))
+         (f (lens--make-sticky (propertize (format ":END-%s:" rand) 'lens-end lens 'read-only t))))
+    (cons h f)))
+
+(defun lens--generate-insert-text (lens)
+  (let* ((insert-fn (plist-get (get (car lens) :display) :insert))
+         (inside (condition-case err (funcall insert-fn (car lens) (copy-tree (caddr lens)))
+                   (error (unless lens-catch-display-errors (error err))
+                          (propertize (format "\n%s\n" err) 'face 'error 'font-lock-face 'error))))
+         (hs (lens--generate-headers lens)))
+    (concat (car hs) inside (cdr hs))))
 
 (defun lens-create (source display)
   (when (lens-at-point t) (error "Cannot create a lens inside of another lens"))
@@ -93,15 +105,15 @@
          (state (funcall (plist-get display :tostate) text))
          (lens (list spec text state))
 
-         (surrounded (lens--generate-insert-text lens)))
+         (insert (lens--generate-insert-text lens)))
 
-    (lens-perform-edit (insert surrounded))
+    (lens-perform-edit (insert insert))
 
     ;; Add hooks
     (add-hook #'filter-buffer-substring-functions #'lens--filter-buffer-substring nil 'local)
     (add-hook 'before-save-hook #'lens--before-save nil 'local)
 
-    (lens--refresh-buffer (point) (+ (point) (length surrounded)))))
+    (lens--refresh-buffer (point) (+ (point) (length insert)))))
 
 ;;; Modifying
 
@@ -118,18 +130,24 @@ provided, then don't save (the new text is already saved)."
                   (list (funcall (plist-get display :totext) new) new)))
 
                (newlens (list spec newtext newstate))
-               (surrounded (lens--generate-insert-text newlens)))
+               (length nil))
+
     (lens-save-position
      (lens-perform-edit
       (if norefresh
-          (progn (put-text-property hb he 'lens-begin newlens)
-                 (put-text-property fb fe 'lens-end newlens))
-        (delete-region hb fe)
-        (insert surrounded))))
+          (let ((strs (lens--generate-headers newlens)))
+            (goto-char fb) (delete-region fb fe) (insert (cdr strs))
+            (goto-char hb) (delete-region hb he) (insert (car strs))
+            (setq length (+ (- fb he) (length (car strs)) (length (cdr strs)))))
+
+        (let ((insert (lens--generate-insert-text newlens)))
+          (delete-region hb fe)
+          (insert insert)
+          (setq length (length insert))))))
 
     (unless external (funcall (plist-get source :save) newtext))
 
-    (lens--refresh-buffer hb (+ hb (length surrounded)))))
+    (lens--refresh-buffer hb (+ hb length))))
 
 ;;; Removing
 
@@ -202,8 +220,8 @@ provided, then don't save (the new text is already saved)."
 
 (defun lens-replace-source (str)
   (list :init (lambda () str)
-        :save (lambda (text))
-        :replace (lambda (text) (get lens :text))))
+        :save (lambda (_text))
+        :replace (lambda (text) text)))
 
 
 ;;;; Buffer Source
@@ -228,7 +246,7 @@ provided, then don't save (the new text is already saved)."
     (dolist (lens-buf lens--buffer-referencers)
       (with-current-buffer lens-buf
         (save-excursion
-          (beginning-of-buffer)
+          (goto-char (point-min))
           (while (setq position (lens-search-forward nil lens-pred))
             (unless (string= (string-trim (cadr (car position)) "\n*" "\n*") str)
               (lens-modify position str :external))))))))
@@ -268,8 +286,7 @@ provided, then don't save (the new text is already saved)."
           (lens--add-buffer-referencer buf (current-buffer))
           (lens--update-source-buffer buf text))
         :replace
-        (lambda (text) (or replaced ""))))
-
+        (lambda (_text) (or replaced ""))))
 
 ;;;; File Source
 
@@ -284,6 +301,12 @@ provided, then don't save (the new text is already saved)."
           ((not (memq lens-buf (cdr pair))) (push file (cdr pair))))
 
     (when buf (lens--add-buffer-referencer buf lens-buf))))
+
+(add-hook 'find-file-hook 'lens-find-file-hook)
+(defun lens-find-file-hook ()
+  (let ((pair (assoc (expand-file-name buffer-file-name) lens--file-referencers)))
+    (dolist (lens-buf (cdr pair))
+      (lens--add-buffer-referencer (current-buffer) lens-buf))))
 
 (defun lens-file-source (file &optional replaced)
   (setq file (expand-file-name file))
@@ -315,19 +338,19 @@ provided, then don't save (the new text is already saved)."
     (fset field onchange)
     (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
 
-    (concat (propertize head 'field-begin field 'read-only t 'rear-nonsticky t)
+    (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
             (propertize text 'modification-hooks hooks 'insert-behind-hooks hooks)
-            (propertize foot 'field-end field 'read-only t))))
+            (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
 
 (defun lens--field-modification-hook (beg _end)
-  (message "insert")
+  ;; (message "insert")
+  ;; modification-hooks gets called BEFORE performing the modification (ik its dumb)
   (run-with-timer 0 nil #'lens--field-modification-callback (set-marker (make-marker) beg))
   ;; (lens--field-modification-callback (set-marker (make-marker) beg))
   )
 
 (defun lens--field-modification-callback (pos)
   (lens-perform-edit
-   ;; (debug)
    (goto-char pos)
 
    (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
@@ -348,8 +371,10 @@ provided, then don't save (the new text is already saved)."
 (defun lens-raw-display ()
   (list :tostate #'identity
         :totext #'identity
-        :insert (lambda (_spec state) (lens--field state #'lens--raw-display-onchange
-                                                   #("\n" 0 1 (front-sticky t)) "\n"))))
+        :insert
+        (lambda (_spec state)
+          (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
+            (lens--make-sticky field :before :after)))))
 
 
 ;;;; Generating Uis
