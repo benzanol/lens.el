@@ -369,13 +369,17 @@ provided, then don't save (the new text is already saved)."
     (lens-modify region text nil :norefresh)
     (funcall (plist-get (get (caar region) :source) :save) text)))
 
-(defun lens-raw-display ()
-  (list :tostate #'identity
-        :totext #'identity
+(defun lens-raw-display (&optional notrim)
+  (list :tostate
+        (if notrim #'identity
+          '(lambda (text) (string-trim text "\n+" "\n+")))
+        :totext
+        (if notrim #'identity
+          '(lambda (state) (if (s-ends-with-p "\n" state) state (concat state "\n"))))
         :insert
-        (lambda (_spec state)
-          (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
-            (lens--make-sticky field :before :after)))))
+        '(lambda (_spec state)
+           (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
+             (lens--make-sticky field :before :after)))))
 
 
 ;;;; Generating Uis
