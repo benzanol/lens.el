@@ -132,22 +132,23 @@ provided, then don't save (the new text is already saved)."
                (newlens (list spec newtext newstate))
                (length nil))
 
-    (lens-save-position
-     (lens-perform-edit
-      (if norefresh
-          (let ((strs (lens--generate-headers newlens)))
-            (goto-char fb) (delete-region fb fe) (insert (cdr strs))
-            (goto-char hb) (delete-region hb he) (insert (car strs))
-            (setq length (+ (- fb he) (length (car strs)) (length (cdr strs)))))
+    (unless (and (string= oldtext newtext) (equal oldstate newstate))
+      (lens-save-position
+       (lens-perform-edit
+        (if norefresh
+            (let ((strs (lens--generate-headers newlens)))
+              (goto-char fb) (delete-region fb fe) (insert (cdr strs))
+              (goto-char hb) (delete-region hb he) (insert (car strs))
+              (setq length (+ (- fb he) (length (car strs)) (length (cdr strs)))))
 
-        (let ((insert (lens--generate-insert-text newlens)))
-          (delete-region hb fe)
-          (insert insert)
-          (setq length (length insert))))))
+          (let ((insert (lens--generate-insert-text newlens)))
+            (delete-region hb fe)
+            (insert insert)
+            (setq length (length insert))))))
 
-    (unless external (funcall (plist-get source :save) newtext))
+      (unless external (funcall (plist-get source :save) newtext))
 
-    (lens--refresh-buffer hb (+ hb length))))
+      (lens--refresh-buffer hb (+ hb length)))))
 
 ;;; Removing
 
