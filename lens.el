@@ -12,6 +12,8 @@
 non-nil, wait for however many seconds of idle time are specified
 before saving a lens' source buffer.")
 
+(defvar lens-save-lenses-on-save t)
+
 
 ;;; Utilities
 ;;;; Utils
@@ -138,9 +140,7 @@ provided, then don't save (the new text is already saved)."
                (title (funcall (or (plist-get (get spec :source) :title) #'identity)))
                (length nil))
 
-    (if (and (string= oldtext newtext) (equal oldstate newstate))
-        (message "nomodify %s" title)
-      (message "modify %s" title)
+    (unless (and (string= oldtext newtext) (equal oldstate newstate))
       (lens-save-position
        (lens-perform-edit
         (if norefresh
@@ -176,7 +176,8 @@ provided, then don't save (the new text is already saved)."
     (save-excursion
       (beginning-of-buffer)
       (while (setq region (lens-search-forward))
-        (when before (funcall before (car region)))
+        (condition-case err (when before (funcall before (car region)))
+          (error (message "Error in remove lens hook: %s" (cadr err))))
         (lens-remove region)))))
 
 
@@ -187,7 +188,7 @@ provided, then don't save (the new text is already saved)."
   (if (or (text-property-not-all 0 (length string) 'lens-begin nil string)
           (text-property-not-all 0 (length string) 'lens-end nil string))
       (with-temp-buffer
-        (lens--inhibit
+        (lens-perform-edit
          (insert string)
          (lens-remove-all)
          (buffer-string)))
@@ -205,7 +206,7 @@ provided, then don't save (the new text is already saved)."
   (when (text-property-not-all (point-min) (point-max) 'lens-begin nil)
     (setq lens--presave (list :text (buffer-string) :pos (point)))
     (add-hook 'after-save-hook #'lens--after-save-once nil 'local)
-    (lens-remove-all (lambda (lens) (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))))
+    (lens-remove-all '(lambda (lens) (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))))
 
 (defun lens--after-save-once ()
   (when lens--presave
@@ -351,28 +352,38 @@ provided, then don't save (the new text is already saved)."
             (propertize text 'modification-hooks hooks 'insert-behind-hooks hooks)
             (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
 
-(defvar lens--modified-fields nil "List of (:buffer BUF :pos MARKER)")
+(defvar lens--modified-fields nil "List of (:buffer BUF :pos MARKER :undo? BOOL)")
 (defun lens--field-modification-hook (beg _end)
   ;; Don't run the modification hook if inside of a primitive-undo
-  (unless (--find (eq (cadr it) #'primitive-undo) (backtrace-frames))
-    (push (list :buffer (current-buffer) :pos (set-marker (make-marker) beg))
-          lens--modified-fields)
-    (add-hook 'post-command-hook #'lens--field-modification-callback)))
+  (push (list :buffer (current-buffer) :pos (set-marker (make-marker) beg)
+              :undo (when (--find (eq (cadr it) #'primitive-undo) (backtrace-frames)) t))
+        lens--modified-fields)
+  (add-hook 'post-command-hook #'lens--field-modification-callback))
 
 (defun lens--field-modification-callback ()
   (remove-hook 'post-command-hook #'lens--field-modification-callback)
-  (dolist (plist (prog1 lens--modified-fields (setq lens--modified-fields nil)))
-    (with-current-buffer (plist-get plist :buffer)
-      (lens-perform-edit
-       (goto-char (plist-get plist :pos))
-       (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
-         (when field
-           (dolist (prop '(modification-hooks insert-behind-hooks))
-             (put-text-property he fb prop '(lens--field-modification-hook)))
-           (goto-char he)
-           (funcall field (buffer-substring-no-properties he fb))
+  (let (saved-lenses)
+    (dolist (plist (prog1 lens--modified-fields (setq lens--modified-fields nil)))
+      (with-current-buffer (plist-get plist :buffer)
+        (lens-perform-edit
+         (goto-char (plist-get plist :pos))
 
-           (lens--refresh-buffer hb fe)))))))
+         (if (plist-get plist :undo)
+             ;; If it was an undo action, we only need to save the current lens
+             (let ((lens (car (lens-at-point t))))
+               (when (and lens (not (memq lens saved-lenses)))
+                 (push lens saved-lenses)
+                 (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))
+
+           ;; Perform the procedure in case there was a proper modification
+           (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
+             (when field
+               (dolist (prop '(modification-hooks insert-behind-hooks))
+                 (put-text-property he fb prop '(lens--field-modification-hook)))
+               (goto-char he)
+               (funcall field (buffer-substring-no-properties he fb))
+
+               (lens--refresh-buffer hb fe)))))))))
 
 
 (defun lens--raw-display-onchange (text)
