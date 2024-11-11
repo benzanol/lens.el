@@ -46,8 +46,7 @@ before saving a lens' source buffer.")
   (put-text-property (1- (length str)) (length str) 'rear-nonsticky (not end) str)
   str)
 
-
-;;;; Dealing with Regions
+;;;; Regions
 
 (defun lens--region-search-forward (beg-prop end-prop &optional val pred)
   (let* ((beg (text-property-search-forward beg-prop val pred))
@@ -80,17 +79,79 @@ before saving a lens' source buffer.")
   (or (lens--region-at-point 'lens-begin 'lens-end)
       (unless noerror (error "No lens at point"))))
 
+;;;; Boxes
+
+(defvar lens-box-mode nil)
+(defvar lens-box-margin 5)
+(defvar lens-box-padding 5)
+
+(bz/face lens-box-top :o "lightskyblue4" :x t :h 1.0 :fg blue :bg bg3 :w bold)
+(bz/face lens-box-bottom :u (:color "lightskyblue4") :x t :h 1 :fg bg :bg bg3)
+(bz/face lens-box-body :bg bg3 :x t)
+(bz/face lens-box-left :bg "lightskyblue4")
+
+(defun lens-boxify (start end &optional id dissolve)
+  (interactive (list (point) (mark)))
+  (when (> start end) (pcase-setq `(,start . ,end) (cons end start)))
+  (setq id (or id (random 99999)))
+
+  (lens-perform-edit
+   (let* ((space (lambda (w) (propertize " " 'display `(space :width (,w)))))
+          (prefix (concat (funcall space lens-box-margin)
+                          (propertize (funcall space 1) 'face 'lens-box-left)
+                          (propertize (funcall space lens-box-padding) 'face 'lens-box-body)))
+          (ps `((lens-box . t) (lens-box-id . ,id)))
+          o old-prefix new-prefix face)
+     (when dissolve (push '(modification-hooks lens--box-modification-hook) ps))
+
+     (remove-overlays (save-excursion (goto-char start) (point-at-bol))
+                      (save-excursion (goto-char end) (1+ (point-at-eol)))
+                      'lens-box t)
+
+     (dolist (top '(t nil))
+       (setq face (if top 'lens-box-top 'lens-box-bottom))
+
+       (goto-char (if top start end))
+       (setq o (make-overlay (point-at-bol) (1+ (point-at-eol))))
+       (overlay-put o 'face face)
+       (dolist (p ps) (overlay-put o (car p) (cdr p)))
+
+       (setq old-prefix (get-text-property (point-at-bol) 'line-prefix))
+       (setq new-prefix (concat old-prefix prefix))
+       (add-face-text-property (1+ (length old-prefix)) (length new-prefix) face :append new-prefix)
+       (add-face-text-property 0 (length new-prefix) '(:height 1) nil new-prefix)
+       (dolist (prop '(line-prefix wrap-prefix)) (overlay-put o prop new-prefix)))
+
+     (setq o (make-overlay (save-excursion (goto-char start) (point-at-eol))
+                           (save-excursion (goto-char end) (point-at-bol))))
+     (overlay-put o 'face 'lens-box-body)
+     (dolist (p ps) (overlay-put o (car p) (cdr p)))
+     (setq new-prefix (concat (get-text-property (overlay-start o) 'line-prefix) prefix))
+     (dolist (prop '(line-prefix wrap-prefix)) (overlay-put o prop new-prefix)))))
+
+(defun lens--boxify-lens (beg end spec)
+  (when lens-box-mode (lens-boxify beg end spec :dissolve)))
+
+(defun lens--box-modification-hook (o &rest args)
+  (message "mod hook")
+  (remove-overlays (point-min) (point-max) 'lens-box-id (overlay-get o 'lens-box-id)))
+
 
 ;;; Lens Lifecycle
 ;;;; Creating
 
+(bz/face lens-header fixed-pitch :fg gray3 :h 0.9)
+(bz/face lens-field-header fixed-pitch :w bold :fg gray3)
+
 (defun lens--generate-headers (lens)
   (let* ((rand (format "%05d" (random 99999)))
          (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
-         (title-str (replace-regexp-in-string "[^A-Za-z0-9-_]" "-" (or title "")))
-         (h-text (format ":LENS-%s-%s:" title-str rand))
+         (h-text (format "[%s] %s" rand (or title "")))
          (h (lens--make-sticky (propertize h-text 'lens-begin lens 'read-only t)))
-         (f (lens--make-sticky (propertize (format ":END-%s:" rand) 'lens-end lens 'read-only t))))
+         (f (lens--make-sticky (propertize (format "[%s]" rand) 'lens-end lens 'read-only t))))
+    (dolist (prop '(face font-lock-face))
+      (put-text-property 0 (length h) prop 'lens-header h)
+      (put-text-property 0 (length f) prop 'lens-header f))
     (cons h f)))
 
 (defun lens--generate-insert-text (lens)
@@ -120,7 +181,8 @@ before saving a lens' source buffer.")
     (add-hook #'filter-buffer-substring-functions #'lens--filter-buffer-substring nil 'local)
     (add-hook 'before-save-hook #'lens--before-save nil 'local)
 
-    (lens--refresh-buffer (point) (+ (point) (length insert)))))
+    (lens--refresh-buffer (point) (+ (point) (length insert)))
+    (lens--boxify-lens (point) (+ (point) (length insert)) spec)))
 
 ;;; Modifying
 
@@ -156,7 +218,8 @@ provided, then don't save (the new text is already saved)."
 
       (unless external (funcall (plist-get source :save) newtext))
 
-      (lens--refresh-buffer hb (+ hb length)))))
+      (lens--refresh-buffer hb (+ hb length))
+      (lens--boxify-lens hb (+ hb length) spec))))
 
 ;;; Removing
 
@@ -166,6 +229,7 @@ provided, then don't save (the new text is already saved)."
                (replace (funcall (plist-get (get spec :source) :replace) text)))
     (lens-perform-edit
      (delete-region hb fe)
+     (remove-overlays (point-min) (point-max) 'lens-box-id spec)
      (insert replace))
 
     (lens--refresh-buffer hb (+ hb (length replace)))))
@@ -174,7 +238,7 @@ provided, then don't save (the new text is already saved)."
   (interactive)
   (let (region)
     (save-excursion
-      (beginning-of-buffer)
+      (goto-char (point-min))
       (while (setq region (lens-search-forward))
         (condition-case err (when before (funcall before (car region)))
           (error (message "Error in remove lens hook: %s" (cadr err))))
@@ -340,13 +404,16 @@ provided, then don't save (the new text is already saved)."
 
 ;;;; Raw display
 
-(bz/face lens-field-header fixed-pitch :w bold :bg bg2 :fg gray3)
 (defun lens--field (text onchange &optional head foot)
   (setq head (or head "---\n") foot (or foot "\n---"))
   (let* ((field (lens--make-symbol "field"))
          (hooks '(lens--field-modification-hook)))
     (fset field onchange)
     (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
+
+    (dolist (prop '(face font-lock-face))
+      (setq head (propertize head prop 'lens-field-header)
+            foot (propertize foot prop 'lens-field-header)))
 
     (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
             (propertize text 'modification-hooks hooks 'insert-behind-hooks hooks)
@@ -370,10 +437,11 @@ provided, then don't save (the new text is already saved)."
 
          (if (plist-get plist :undo)
              ;; If it was an undo action, we only need to save the current lens
-             (let ((lens (car (lens-at-point t))))
+             (pcase-let ((`(,lens ,hb ,he ,fb ,fe) (lens-at-point t)))
                (when (and lens (not (memq lens saved-lenses)))
                  (push lens saved-lenses)
-                 (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))
+                 (funcall (plist-get (get (car lens) :source) :save) (cadr lens))
+                 (lens--boxify-lens hb fe (car lens))))
 
            ;; Perform the procedure in case there was a proper modification
            (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
@@ -553,7 +621,10 @@ provided, then don't save (the new text is already saved)."
          (path (and link (string= link "file") (org-element-property :path context)))
          (start (and link (org-element-property :begin context)))
          (end (and link (org-element-property :end context))))
-    (when (and path start end) (lens-insert-file start end path))))
+    (when (and path start end)
+      ;; (when (save-excursion (goto-char start) (and (bolp) (not (bobp)))) (setq start (1- start)))
+      ;; (when (save-excursion (goto-char end) (and (eolp) (not (eobp)))) (setq end (1+ end)))
+      (lens-insert-file start end path))))
 
 
 ;;; UIs
