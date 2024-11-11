@@ -141,7 +141,7 @@ before saving a lens' source buffer.")
 ;;;; Creating
 
 (bz/face lens-header fixed-pitch :fg gray3 :h 0.9)
-(bz/face lens-field-header fixed-pitch :w bold :fg gray3)
+(bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
 
 (defun lens--generate-headers (lens)
   (let* ((rand (format "%05d" (random 99999)))
@@ -199,7 +199,7 @@ provided, then don't save (the new text is already saved)."
                   (list (funcall (plist-get display :totext) new) new)))
 
                (newlens (list spec newtext newstate))
-               (title (funcall (or (plist-get (get spec :source) :title) #'identity)))
+               (title (funcall (or (plist-get (get spec :source) :title) #'ignore)))
                (length nil))
 
     (unless (and (string= oldtext newtext) (equal oldstate newstate))
@@ -292,10 +292,11 @@ provided, then don't save (the new text is already saved)."
 ;;; Some Sources and Displays
 ;;;; Region Source
 
-(defun lens-replace-source (str)
+(defun lens-replace-source (str &optional above below)
+  (setq above (or above "") below (or below ""))
   (list :init (lambda () str)
         :save (lambda (_text))
-        :replace (lambda (text) text)))
+        :replace (lambda (text) (concat above text below))))
 
 
 ;;;; Buffer Source
@@ -456,20 +457,18 @@ provided, then don't save (the new text is already saved)."
 
 (defun lens--raw-display-onchange (text)
   (let ((region (lens-at-point)))
-    (lens-modify region text nil :norefresh)
-    (funcall (plist-get (get (caar region) :source) :save) text)))
+    (lens-modify region text nil :norefresh)))
 
-(defun lens-raw-display (&optional notrim)
+(defun lens--raw-display-insert (_spec state)
+  (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
+    (lens--make-sticky field :before :after)))
+
+(defun lens-raw-display (&optional forward-filter backward-filter)
   (list :tostate
-        (if notrim #'identity
-          '(lambda (text) (string-trim text "\n+" "\n+")))
-        :totext
-        (if notrim #'identity
-          '(lambda (state) (if (s-ends-with-p "\n" state) state (concat state "\n"))))
-        :insert
-        '(lambda (_spec state)
-           (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
-             (lens--make-sticky field :before :after)))))
+        (lambda (text)
+          (funcall (or forward-filter #'identity) (string-trim text "\n+" "\n+")))
+        :totext (or backward-filter #'identity)
+        :insert #'lens--raw-display-insert))
 
 
 ;;;; Generating Uis
@@ -520,7 +519,7 @@ provided, then don't save (the new text is already saved)."
 
     (`(row . ,cols)
      (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
-                         (propertize " | " 'read-only t)))
+                         (propertize " " 'read-only t)))
 
     ;; Elements that are also valid columns
 
@@ -572,59 +571,148 @@ provided, then don't save (the new text is already saved)."
   (let ((name (completing-read (or prompt "Ui: ") (mapcar #'car lens-ui-alist))))
     (alist-get (intern name) lens-ui-alist)))
 
-(defun lens-insert-ui (beg end ui)
+
+(defun lens--replace-create (beg end src-func display)
+  (let ((str (buffer-substring-no-properties beg end)))
+    (lens-perform-edit
+     (delete-region beg end)
+     (lens-create (funcall src-func str) display))))
+
+(defun lens--wrapped-create (hb he fb fe src-func display)
+  (let ((head (buffer-substring-no-properties hb he))
+        (body (buffer-substring-no-properties he fb))
+        (foot (buffer-substring-no-properties fb fe)))
+    (lens-perform-edit
+     (delete-region hb fe)
+     (lens-create (funcall src-func body head foot) display))))
+
+
+(defun lens-create-buffer (beg end buffer)
+  (interactive (list (point) (if mark-active (mark) (point)) (read-buffer "Buffer: ")))
+  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-raw-display)))
+
+(defun lens-create-file (beg end file)
+  (interactive (list (point) (if mark-active (mark) (point)) (read-file-name "File: ")))
+  (lens--replace-create beg end (lambda (str) (lens-file-source file str)) (lens-raw-display)))
+
+(defun lens-create-ui (beg end ui)
   (interactive (list (point) (if mark-active (mark) (point))
                      (or (lens-read-ui) (error "No ui selected"))))
-  (let ((str (buffer-substring-no-properties beg end)))
-    (lens-perform-edit
-     (delete-region beg end)
-     (lens-create (lens-replace-source str) (lens-ui-display ui)))))
+  (lens--replace-create beg end #'lens-replace-source (lens-ui-display ui)))
 
-(defun lens-insert-buffer-ui (beg end buffer ui)
+(defun lens-create-buffer-ui (beg end buffer ui)
   (interactive (list (point) (if mark-active (mark) (point))
                      (read-buffer "Buffer: ") (lens-read-ui)))
-  (let ((str (buffer-substring-no-properties beg end)))
-    (lens-perform-edit
-     (delete-region beg end)
-     (lens-create (lens-buffer-source buffer str) (lens-ui-display ui)))))
+  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-ui-display ui)))
 
-(defun lens-insert-buffer (beg end buffer)
-  (interactive (list (point) (if mark-active (mark) (point)) (read-buffer "Buffer: ")))
-  (let ((str (buffer-substring-no-properties beg end)))
-    (lens-perform-edit
-     (delete-region beg end)
-     (lens-create (lens-buffer-source buffer str) (lens-raw-display)))))
-
-(defun lens-insert-file (beg end file)
-  (interactive (list (point) (if mark-active (mark) (point)) (read-file-name "File: ")))
-  (let ((str (buffer-substring-no-properties beg end)))
-    (lens-perform-edit
-     (delete-region beg end)
-     (lens-create (lens-file-source file str) (lens-raw-display)))))
-
-(defun lens-create-file (path)
+(defun lens-create-new-file (path)
   (interactive (list (read-file-name "Create Lens: " "lenses/")))
 
-  (let* ((rel (f-relative path (f-parent buffer-file-name)))
-         (rel (if (string-match-p "\\`[/~]" rel) rel (concat "./" rel)))
+  (let* ((rel1 (f-relative path (f-parent buffer-file-name)))
+         (rel (if (string-match-p "\\`[/~]" rel1) rel1 (concat "./" rel1)))
          (link (format "[[%s]]" rel)))
     (mkdir (f-parent path) t)
     (f-touch path)
     (find-file-noselect path t)
-    (lens-perform-edit
-     (lens-create (lens-file-source path link) (lens-raw-display)))))
+    (lens-create (lens-file-source path link) (lens-raw-display))))
 
-(defun lens-org-link ()
+
+;;; Auto Mode
+;;;; Mode
+
+(defvar-local lens-auto-matchers nil
+  "Alist of a regexp to a function")
+
+(define-minor-mode lens-auto-mode
+  "Automatically create lenses based on regexps."
+  :global nil
+  :init-value nil
+  (if (not lens-auto-mode) (lens-remove-all)
+    (setq lens-auto-matchers (alist-get major-mode lens-auto-mode-alist))
+    (lens-auto-insert-all)))
+
+(defun lens-auto-search-forward ()
+  (let ((init (point))
+        match-pos match-assoc)
+    (dolist (assoc lens-auto-matchers)
+      (goto-char init)
+      (and (re-search-forward (car assoc) nil :noerror)
+           (or (null match-pos) (< (match-beginning 0) match-pos))
+           (setq match-pos (match-beginning 0) match-assoc assoc)))
+    (when match-pos
+      (goto-char match-pos)
+      (looking-at (car match-assoc)) ;; Set the match data
+      match-assoc)))
+
+(defun lens-auto-insert-all ()
   (interactive)
+  (let (assoc end)
+    (save-excursion
+      (lens-remove-all)
+      (goto-char (point-min))
+      (while (setq assoc (lens-auto-search-forward))
+        (setq end (match-end 0))
+        (funcall (cadr assoc))
+        (goto-char end)))))
+
+(defun lens-auto-at-point ()
+  (interactive)
+  (let ((target (point))
+        done assoc)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not done)
+        (setq assoc (lens-auto-search-forward))
+        (cond
+         ;; If we have passed the target position
+         ((or (null assoc) (> (match-beginning 0) target)) (error "No auto lens at point"))
+         ;; If we have not yet reached the target position
+         ((< (match-end 0) target) (goto-char (match-end 0)))
+         ;; If we have found a lens containing the target position
+         (t (funcall (cadr assoc)) (setq done t)))))))
+
+;;;; Org Mode
+
+(setq lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens$")
+(defun lens-auto--org-block ()
+  (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
+        (hb (match-beginning 0)) (he (match-beginning 2))
+        (fb (match-end 2)) (fe (match-end 0)))
+    (when ui (lens--wrapped-create hb he fb fe #'lens-replace-source (lens-ui-display ui)))))
+
+
+(defun lens--org-forward-filter (text)
+  (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
+
+(defun lens--org-backward-filter (text)
+  (message "YA")
+  (setq a (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text)))
+
+(defun lens-auto--org-file-link ()
   (let* ((context (org-element-context))
          (link (and (eq (car context) 'link) (org-element-property :type context)))
          (path (and link (string= link "file") (org-element-property :path context)))
-         (start (and link (org-element-property :begin context)))
+         (beg (and link (org-element-property :begin context)))
          (end (and link (org-element-property :end context))))
-    (when (and path start end)
-      ;; (when (save-excursion (goto-char start) (and (bolp) (not (bobp)))) (setq start (1- start)))
+    (when (and path beg end)
+      ;; (when (save-excursion (goto-char beg) (and (bolp) (not (bobp)))) (setq beg (1- beg)))
       ;; (when (save-excursion (goto-char end) (and (eolp) (not (eobp)))) (setq end (1+ end)))
-      (lens-insert-file start end path))))
+      (lens--replace-create beg end (lambda (str) (lens-file-source path str))
+                            (lens-raw-display #'lens--org-forward-filter
+                                              #'lens--org-backward-filter)))))
+
+
+(setq lens-auto-matchers:org-mode
+      `((,org-any-link-re lens-auto--org-file-link)
+        (,lens-auto--org-block-re lens-auto--org-block)))
+
+
+;;;; Mode Alist
+
+(setq lens-auto-mode-alist
+      `((org-mode . ,lens-auto-matchers:org-mode)))
+
+
 
 
 ;;; UIs
@@ -638,11 +726,12 @@ provided, then don't save (the new text is already saved)."
     (concat (make-string (max 0 (plist-get st :count)) ?-) "\n" (plist-get st :rest)))
   :toui
   (lambda (st)
-    `("hello"
-      (row
-       ,(format ">>#%s<<" (plist-get st :count))
+    `((row
+       (button "/2" ,(@0 (=> (plist-get st :count) / 2)))
+       (button "-" ,(@0 (=> (plist-get st :count) - 1)))
+       ,(format "#%s" (plist-get st :count))
        (button "+" ,(@0 (=> (plist-get st :count) + 1)))
-       (button "-" ,(@0 (=> (plist-get st :count) - 1))))
+       (button "x2" ,(@0 (=> (plist-get st :count) * 2))))
       (box ,(plist-get st :rest)
            ,(@1 (plist-put st :rest @1))))))
 
