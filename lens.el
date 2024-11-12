@@ -649,7 +649,7 @@ provided, then don't save (the new text is already saved)."
 
 ;;;; Org Mode
 
-(setq lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens$")
+(setq lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens\n")
 (defun lens-auto--org-block ()
   (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
         (hb (match-beginning 0)) (he (match-beginning 2))
@@ -661,25 +661,22 @@ provided, then don't save (the new text is already saved)."
   (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
 
 (defun lens--org-backward-filter (text)
-  (message "YA")
-  (setq a (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text)))
+  (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
 
+(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-any-link-re))
 (defun lens-auto--org-file-link ()
-  (let* ((context (org-element-context))
-         (link (and (eq (car context) 'link) (org-element-property :type context)))
-         (path (and link (string= link "file") (org-element-property :path context)))
-         (beg (and link (org-element-property :begin context)))
-         (end (and link (org-element-property :end context))))
-    (when (and path beg end)
-      ;; (when (save-excursion (goto-char beg) (and (bolp) (not (bobp)))) (setq beg (1- beg)))
-      ;; (when (save-excursion (goto-char end) (and (eolp) (not (eobp)))) (setq end (1+ end)))
+  (let* ((beg (match-beginning 0)) (end (match-end 0))
+         (context (org-element-context))
+         (link-type (and (eq (car context) 'link) (org-element-property :type context)))
+         (path (and link-type (string= link-type "file") (org-element-property :path context))))
+    (when path
       (lens--replace-create beg end (lambda (str) (lens-file-source path str))
                             (lens-raw-display #'lens--org-forward-filter
                                               #'lens--org-backward-filter)))))
 
 
 (setq lens-auto-matchers:org-mode
-      `((,org-any-link-re lens-auto--org-file-link)
+      `((,lens-auto--org-link-re lens-auto--org-file-link)
         (,lens-auto--org-block-re lens-auto--org-block)))
 
 
