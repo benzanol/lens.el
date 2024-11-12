@@ -46,6 +46,14 @@ before saving a lens' source buffer.")
   (put-text-property (1- (length str)) (length str) 'rear-nonsticky (not end) str)
   str)
 
+(defun lens--append-face (beg end face &optional object)
+  (when face
+    (let ((fn `(lambda (f)
+                 (if (or (not (listp f)) (keywordp (car f)))
+                     (list f ',face) (append f (list ',face))))))
+      (alter-text-property beg end 'face fn object)
+      (alter-text-property beg end 'font-lock-face fn object))))
+
 
 ;;;; Regions
 
@@ -92,12 +100,14 @@ before saving a lens' source buffer.")
 (defvar lens-default-style nil)
 
 (defun lens--generate-headers (lens)
-  (-let* (((&plist :head-props hps :foot-props fps) (get (car lens) :style))
+  (-let* (((&plist :head-props hps :foot-props fps :head-face hf :foot-face ff) (get (car lens) :style))
           (rand (format "%05d" (random 99999)))
           (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
           (h-text (format "[%s] %s" rand (or title "")))
           (h (apply #'propertize h-text 'lens-begin lens 'read-only t hps))
           (f (apply #'propertize (format "[%s]\n" rand) 'lens-end lens 'read-only t fps)))
+    (lens--append-face 0 (length h) hf h)
+    (lens--append-face 0 (length f) ff f)
     (cons (lens--make-sticky h) (lens--make-sticky f))))
 
 (defun lens--generate-insert-text (lens)
@@ -107,8 +117,15 @@ before saving a lens' source buffer.")
                           (propertize (format "\n%s\n" err) 'face 'error 'font-lock-face 'error))))
          (hs (lens--generate-headers lens))
          (style (get (car lens) :style)))
+
+    ;; The first character of the insert text should be a newline,
+    ;; which is styled as part of the header
     (add-text-properties 0 1 (plist-get style :head-props) inside)
+    (lens--append-face 0 1 (plist-get style :head-face) inside)
+
     (add-text-properties 1 (length inside) (plist-get style :props) inside)
+    (lens--append-face 1 (length inside) (plist-get style :face) inside)
+
     (concat (car hs) inside (cdr hs))))
 
 (defun lens-create (source display &optional style)
@@ -153,18 +170,21 @@ provided, then don't save (the new text is already saved)."
       (lens-save-position
        (lens-perform-edit
         (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
+        (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
 
         (if norefresh
             (let ((strs (lens--generate-headers newlens)))
               (goto-char fb) (delete-region fb fe) (insert (cdr strs))
-              (goto-char hb) (delete-region hb he) (insert (car strs)))
+              (lens--refresh-buffer fb (point))
+              (goto-char hb) (delete-region hb he) (insert (car strs))
+              (lens--refresh-buffer hb (point)))
 
           (let ((insert (lens--generate-insert-text newlens)))
             (delete-region hb fe)
             (insert insert)
             (lens--refresh-buffer hb (point))))))
 
-      (unless external (funcall (plist-get source :save) newtext)))))
+      (unless external (funcall (plist-get source :update) newtext)))))
 
 
 ;;;; Removing
@@ -216,7 +236,9 @@ provided, then don't save (the new text is already saved)."
   (when (text-property-not-all (point-min) (point-max) 'lens-begin nil)
     (setq lens--presave (list :text (buffer-string) :pos (point)))
     (add-hook 'after-save-hook #'lens--after-save-once nil 'local)
-    (lens-remove-all '(lambda (lens) (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))))
+    (lens-remove-all
+     '(lambda (lens)
+        (funcall (or (plist-get (get (car lens) :source) :save) #'ignore))))))
 
 (defun lens--after-save-once ()
   (when lens--presave
@@ -241,7 +263,7 @@ provided, then don't save (the new text is already saved)."
 (defun lens-replace-source (str &optional above below)
   (setq above (or above "") below (or below ""))
   (list :init (lambda () str)
-        :save (lambda (_text))
+        :update (lambda (_text))
         :replace (lambda (text) (concat above text below))))
 
 
@@ -280,15 +302,8 @@ provided, then don't save (the new text is already saved)."
        (remove-overlays (point-min) (point-max))
        (delete-region (point-min) (point-max))
        (insert text))
-      ;; Save later
-      (when lens--idle-save-timer (cancel-timer lens--idle-save-timer))
-      (when (and buffer-file-name (numberp lens-idle-save-delay))
-        (setq lens--idle-save-timer (run-with-timer lens-idle-save-delay nil #'lens--save-source-buffer buf)))
       ;; Update other lenses
-      (lens--update-buffer-referencers)
-      ;; Too expensive
-      ;; (lens--refresh-buffer)
-      )))
+      (lens--update-buffer-referencers))))
 
 (defun lens--save-source-buffer (buf)
   (with-current-buffer buf
@@ -303,13 +318,17 @@ provided, then don't save (the new text is already saved)."
         (lambda ()
           (lens--add-buffer-referencer buf (current-buffer))
           (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))
-        :title (lambda () (buffer-name buf))
-        :save
+        :update
         (lambda (text)
           (lens--add-buffer-referencer buf (current-buffer))
           (lens--update-source-buffer buf text))
         :replace
-        (lambda (_text) (or replaced ""))))
+        (lambda (_text) (or replaced ""))
+        :save
+        (lambda ()
+          (lens--add-buffer-referencer buf (current-buffer))
+          (with-current-buffer buf (when buffer-file-name (save-buffer))))
+        :title (lambda () (buffer-name buf))))
 
 
 ;;;; File Source
@@ -319,12 +338,12 @@ provided, then don't save (the new text is already saved)."
   (setq file (expand-file-name file)
         lens-buf (get-buffer lens-buf))
   (let ((pair (assoc file lens--file-referencers))
-        (buf (get-file-buffer file)))
+        (file-buf (get-file-buffer file)))
 
     (cond ((null pair) (push (list file lens-buf) lens--file-referencers))
           ((not (memq lens-buf (cdr pair))) (push file (cdr pair))))
 
-    (when buf (lens--add-buffer-referencer buf lens-buf))))
+    (when file-buf (lens--add-buffer-referencer file-buf lens-buf))))
 
 (add-hook 'find-file-hook 'lens-find-file-hook)
 (defun lens-find-file-hook ()
@@ -341,15 +360,19 @@ provided, then don't save (the new text is already saved)."
           (let ((buf (get-file-buffer file)))
             (if (null buf) (f-read file)
               (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))))
-        :title (lambda () (f-relative file default-directory))
-        :save
+        :update
         (lambda (text)
           (lens--add-file-referencer file (current-buffer))
           (let ((buf (get-file-buffer file)))
             (if (null buf) (write-region text nil file)
               (lens--update-source-buffer buf text))))
         :replace
-        (lambda (_plist) (or replaced ""))))
+        (lambda (_plist) (or replaced ""))
+        :save
+        (lambda ()
+          (let ((buf (get-file-buffer file)))
+            (when buf (with-current-buffer buf (save-buffer)))))
+        :title (lambda () (f-relative file default-directory))))
 
 
 ;;;; Raw display
@@ -386,11 +409,11 @@ provided, then don't save (the new text is already saved)."
          (goto-char (plist-get plist :pos))
 
          (if (plist-get plist :undo)
-             ;; If it was an undo action, we only need to save the current lens
+             ;; If it was an undo action, we only need to update the restored lens
              (pcase-let ((`(,lens ,hb ,he ,fb ,fe) (lens-at-point t)))
                (when (and lens (not (memq lens saved-lenses)))
                  (push lens saved-lenses)
-                 (funcall (plist-get (get (car lens) :source) :save) (cadr lens))))
+                 (funcall (plist-get (get (car lens) :source) :update) (cadr lens))))
 
            ;; Perform the procedure in case there was a proper modification
            (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
@@ -671,9 +694,9 @@ provided, then don't save (the new text is already saved)."
 (bz/face lens-box-overline :o "lightskyblue4")
 (bz/face lens-box-underline :u (:color "lightskyblue4"))
 
-(bz/face lens-box-top lens-box-overline :x t :h 1.0 :fg blue :bg bg4 :w bold)
-(bz/face lens-box-bottom lens-box-underline :x t :h 1 :fg bg :bg bg4)
 (bz/face lens-box-body :bg bg4 :x t)
+(bz/face lens-box-head (lens-box-overline fixed-pitch) :x t :h 0.9 :fg blue :bg bg4 :w bold)
+(bz/face lens-box-foot (lens-box-underline fixed-pitch) :x t :h 1 :fg bg :bg bg4)
 
 (bz/face lens-box-vert :bg "lightskyblue4")
 (bz/face lens-box-padding :bg bg4)
@@ -693,15 +716,12 @@ provided, then don't save (the new text is already saved)."
                                 (add-face-text-property 0 3 '(:height 1) nil s))))
 
 (setq lens-box-style
-      (list :props
-            (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix
-                  'font-lock-face 'lens-box-body)
-            :head-props
-            (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix
-                  'font-lock-face 'lens-box-top)
-            :foot-props
-            (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix
-                  'font-lock-face 'lens-box-bottom)))
+      (list :props (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix)
+            :face 'lens-box-body
+            :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix)
+            :head-face 'lens-box-head
+            :foot-props (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix)
+            :foot-face 'lens-box-foot))
 
 (setq lens-default-style lens-box-style)
 ;; (setq lens-default-style nil)
