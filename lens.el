@@ -230,6 +230,8 @@ provided, then don't save (the new text is already saved)."
   (lens--remove-lenses-from-string (funcall fun start end delete)))
 
 
+;;;; Saving
+
 (defvar-local lens--presave nil)
 
 (defun lens--before-save ()
@@ -238,7 +240,9 @@ provided, then don't save (the new text is already saved)."
     (add-hook 'after-save-hook #'lens--after-save-once nil 'local)
     (lens-remove-all
      '(lambda (lens)
-        (funcall (or (plist-get (get (car lens) :source) :save) #'ignore))))))
+        (let ((text (cadr lens)) (src (get (car lens) :source)))
+          (funcall (plist-get src :update) text)
+          (funcall (or (plist-get src :save) #'ignore) text))))))
 
 (defun lens--after-save-once ()
   (when lens--presave
@@ -325,8 +329,7 @@ provided, then don't save (the new text is already saved)."
         :replace
         (lambda (_text) (or replaced ""))
         :save
-        (lambda ()
-          (lens--add-buffer-referencer buf (current-buffer))
+        (lambda (text)
           (with-current-buffer buf (when buffer-file-name (save-buffer))))
         :title (lambda () (buffer-name buf))))
 
@@ -335,13 +338,12 @@ provided, then don't save (the new text is already saved)."
 
 (defvar lens--file-referencers nil "Alist of files to buffers with a file source.")
 (defun lens--add-file-referencer (file lens-buf)
-  (setq file (expand-file-name file)
-        lens-buf (get-buffer lens-buf))
-  (let ((pair (assoc file lens--file-referencers))
+  (setq file (expand-file-name file) lens-buf (get-buffer lens-buf))
+  (let ((assoc (assoc file lens--file-referencers))
         (file-buf (get-file-buffer file)))
 
-    (cond ((null pair) (push (list file lens-buf) lens--file-referencers))
-          ((not (memq lens-buf (cdr pair))) (push file (cdr pair))))
+    (cond ((null assoc) (push (list file lens-buf) lens--file-referencers))
+          ((not (memq lens-buf (cdr assoc))) (push file (cdr assoc))))
 
     (when file-buf (lens--add-buffer-referencer file-buf lens-buf))))
 
@@ -363,15 +365,13 @@ provided, then don't save (the new text is already saved)."
         :update
         (lambda (text)
           (lens--add-file-referencer file (current-buffer))
-          (let ((buf (get-file-buffer file)))
-            (if (null buf) (write-region text nil file)
-              (lens--update-source-buffer buf text))))
+          (when (get-file-buffer file) (lens--update-source-buffer (get-file-buffer file) text)))
         :replace
         (lambda (_plist) (or replaced ""))
         :save
-        (lambda ()
-          (let ((buf (get-file-buffer file)))
-            (when buf (with-current-buffer buf (save-buffer)))))
+        (lambda (text)
+          (if (null (get-file-buffer file)) (write-region text nil file)
+            (with-current-buffer (get-file-buffer file) (save-buffer))))
         :title (lambda () (f-relative file default-directory))))
 
 
