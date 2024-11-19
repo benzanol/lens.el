@@ -51,7 +51,9 @@ redisplay will be cancelled.")
 
 (defmacro lens-silent-edit (&rest body)
   "Perform the changes in BODY without any consequences."
-  `(let ((inhibit-read-only t) (inhibit-modification-hooks t))
+  `(let ((inhibit-read-only t)
+         (inhibit-modification-hooks t)
+         (inhibit-point-motion-hooks t))
      (save-excursion (atomic-change-group ,@body))))
 
 (defun lens--make-symbol (name &rest props)
@@ -108,7 +110,8 @@ representing the bounds of the region.
 VAL and PRED can be used to search for a particular region,
 following the same convention as `text-property-search-forward'."
 
-  (let* ((beg (text-property-search-forward beg-prop val pred))
+  (let* ((inhibit-point-motion-hooks t)
+         (beg (text-property-search-forward beg-prop val pred))
          (beg-val (when beg (prop-match-value beg)))
          (end (when beg-val (text-property-search-forward end-prop beg-val #'eq))))
     (when end
@@ -121,7 +124,8 @@ following the same convention as `text-property-search-forward'."
 
 The bounds of the region are specified by BEG-PROP and END-PROP,
 as described by `lens--region-search-forward'."
-  (let* ((start (point))
+  (let* ((inhibit-point-motion-hooks t)
+         (start (point))
          (hb nil) (he nil)
          (pred (lambda (_nil val)
                  (and val
@@ -340,6 +344,8 @@ reinserted."
 (defun lens-remove (region)
   "Remove the lens at REGION."
   (interactive (list (lens-at-point)))
+  (lens-unfold (car region))
+
   (pcase-let* ((`((,spec ,text ,state) ,hb ,he ,fb ,fe) region)
                (replace (funcall (plist-get (get spec :source) :replace) text)))
     (lens-silent-edit
@@ -611,7 +617,7 @@ the previous command, as described in `lens--field'."
 
          (if (plist-get plist :undo)
              ;; If it was an undo action, we only need to update the restored lens
-             (pcase-let ((`(,lens ,hb ,he ,fb ,fe) (lens-at-point t)))
+             (pcase-let ((`(,lens ,_hb ,_he ,_fb ,_fe) (lens-at-point t)))
                (when (and lens (not (memq lens saved-lenses)))
                  (push lens saved-lenses)
                  (funcall (plist-get (get (car lens) :source) :update) (cadr lens))))
@@ -818,11 +824,114 @@ UI is a plist with properties :tostate, :totext, and :toui."
     (lens-create (lens-file-source path link) (lens-raw-display))))
 
 
+;;; Folding
+
+(defun lens-fold (region)
+  "Fold the lens at REGION, or at point."
+  (interactive (list (lens-at-point)))
+  (remove-overlays nil nil 'lens-fold (car region))
+
+  (pcase-let* ((`(,lens ,_hb ,he ,fb ,fe) region)
+               (face (plist-get (get (car lens) :style) :head-face))
+               (o1 (make-overlay he (1- fb)))
+               (o2 (make-overlay he fe))
+               (o3 (when face (make-overlay (1- fb) fb))))
+    (overlay-put o1 'lens-fold lens)
+    (overlay-put o1 'invisible t)
+    (overlay-put o1 'before-string (propertize "..." 'face face))
+
+    (overlay-put o2 'lens-fold lens)
+    (overlay-put o2 'intangible t)
+
+    (when o3
+      (overlay-put o3 'lens-fold lens)
+      (overlay-put o3 'face face))))
+
+(defun lens-unfold (lens)
+  "Unfold LENS, or the lens at point."
+  (interactive (list (car (lens-at-point))))
+  (remove-overlays (point-min) (point-max) 'lens-fold lens))
+
+(defun lens-fold-all ()
+  "Fold all lenses in the current buffer."
+  (interactive)
+  (lens-run-on-all #'lens-fold))
+
+(defun lens-unfold-all ()
+  "Unfold all lenses in the current buffer."
+  (interactive)
+  (dolist (o (overlays-in (point-min) (point-max)))
+    (when (overlay-get o 'lens-fold)
+      (delete-overlay o))))
+
+(defun lens-fold-toggle (region)
+  "Toggle whether the lens at REGION, or at point, is folded."
+  (interactive (list (lens-at-point)))
+  (if (--find (eq (car region) (overlay-get it 'lens-fold))
+              (overlays-in (point-min) (point-max)))
+      (lens-unfold (car region))
+    (lens-fold region)))
+
+(defun lens-fold-toggle-all ()
+  "Toggle whether all overlays in the current buffer are folded.
+
+If all overlays are folded, unfold all overlays. Otherwise, fold
+all overlays."
+  (interactive)
+  (let* ((os (overlays-in (point-min) (point-max)))
+         (lenses (-uniq (--map (overlay-get it 'lens-fold) os)))
+         (all-folded t))
+    (lens-run-on-all
+     (lambda (region)
+       (unless (memq (car region) lenses)
+         (setq all-folded nil))))
+    (if all-folded
+        (lens-unfold-all)
+      (lens-fold-all))))
+
+
 ;;; Auto Mode
+;;;; Org Matchers
+
+(defvar lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens\n")
+(defun lens-auto--org-block ()
+  (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
+        (hb (match-beginning 0)) (he (match-beginning 2))
+        (fb (match-end 2)) (fe (match-end 0)))
+    (when ui (lens--wrapped-create hb he fb fe #'lens-replace-source (lens-ui-display ui)))))
+
+
+(defun lens--org-forward-filter (text)
+  (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
+
+(defun lens--org-backward-filter (text)
+  (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
+
+(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-any-link-re))
+(defun lens-auto--org-file-link ()
+  (let* ((beg (match-beginning 0)) (end (match-end 0))
+         (context (org-element-context))
+         (link-type (and (eq (car context) 'link) (org-element-property :type context)))
+         (path (and link-type (string= link-type "file") (org-element-property :path context))))
+    (when path
+      (lens--replace-create beg end (lambda (str) (lens-file-source path str))
+                            (lens-raw-display #'lens--org-forward-filter
+                                              #'lens--org-backward-filter)))))
+
+
+(defvar lens-auto-matchers:org-mode
+  `((,lens-auto--org-link-re lens-auto--org-file-link)
+    (,lens-auto--org-block-re lens-auto--org-block)))
+
+
 ;;;; Mode
 
 (defvar-local lens-auto-matchers nil
-  "Alist of a regexp to a function")
+  "Alist of a regexp to a function.")
+
+(defvar lens-auto-mode-alist
+  `((org-mode . ,lens-auto-matchers:org-mode))
+  "Alist of major modes to values of `lens-auto-matchers'.")
 
 (define-minor-mode lens-auto-mode
   "Automatically create lenses based on regexps."
@@ -873,45 +982,6 @@ UI is a plist with properties :tostate, :totext, and :toui."
          (t (funcall (cadr assoc)) (setq done t)))))))
 
 
-;;;; Org Mode
-
-(setq lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens\n")
-(defun lens-auto--org-block ()
-  (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
-        (hb (match-beginning 0)) (he (match-beginning 2))
-        (fb (match-end 2)) (fe (match-end 0)))
-    (when ui (lens--wrapped-create hb he fb fe #'lens-replace-source (lens-ui-display ui)))))
-
-
-(defun lens--org-forward-filter (text)
-  (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
-
-(defun lens--org-backward-filter (text)
-  (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
-
-(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-any-link-re))
-(defun lens-auto--org-file-link ()
-  (let* ((beg (match-beginning 0)) (end (match-end 0))
-         (context (org-element-context))
-         (link-type (and (eq (car context) 'link) (org-element-property :type context)))
-         (path (and link-type (string= link-type "file") (org-element-property :path context))))
-    (when path
-      (lens--replace-create beg end (lambda (str) (lens-file-source path str))
-                            (lens-raw-display #'lens--org-forward-filter
-                                              #'lens--org-backward-filter)))))
-
-
-(setq lens-auto-matchers:org-mode
-      `((,lens-auto--org-link-re lens-auto--org-file-link)
-        (,lens-auto--org-block-re lens-auto--org-block)))
-
-
-;;;; Mode Alist
-
-(setq lens-auto-mode-alist
-      `((org-mode . ,lens-auto-matchers:org-mode)))
-
-
 ;;; Boxes
 
 (bz/face lens-box-overline :o "lightskyblue4")
@@ -938,15 +1008,22 @@ UI is a plist with properties :tostate, :totext, and :toui."
                          (prog1 s (add-face-text-property 2 3 'lens-box-underline nil s)
                                 (add-face-text-property 0 3 '(:height 1) nil s))))
 
+(bz/keys lens-header-map
+  :sparse t
+  :parent org-mode-map
+  [remap bz/fold-toggle] lens-fold-toggle
+  )
+
 (setq lens-box-style
       (list :props (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix)
             :face 'lens-box-body
-            :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix)
+            :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix
+                              'local-map lens-header-map 'keymap lens-header-map)
             :head-face 'lens-box-head
             :foot-props (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix)
-            :foot-face 'lens-box-foot))
+            :foot-face 'lens-box-foot)
+      lens-default-style lens-box-style)
 
-(setq lens-default-style lens-box-style)
 ;; (setq lens-default-style nil)
 
 ;;; UIs
