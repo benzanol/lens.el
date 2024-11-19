@@ -5,6 +5,9 @@
 (require 'org)
 (require 'text-property-search)
 
+;;; Variables
+;;;; User Variables
+
 (defvar lens-catch-display-errors t
   "Non-nil if display errors should be caught.
 
@@ -16,6 +19,15 @@ redisplay will be cancelled.")
 
 (defvar lens-save-lenses-on-save t
   "If non-nil, save lens source buffers when saving a buffer.")
+
+
+;;;; Internal Variables
+
+(defvar-local lens--buffer-referencers nil
+  "List of lens buffers that reference the current buffer.")
+
+(defvar lens--modified-fields nil
+  "List of (:buffer BUF :pos MARKER :undo? BOOL).")
 
 
 ;;; Utilities
@@ -269,7 +281,7 @@ face, as it will trample all other faces in the region."
     (add-hook 'before-save-hook #'lens--before-save nil 'local)
     ;; Buffer substring filter
     (make-local-variable 'buffer-substring-filters)
-    (add-to-list 'buffer-substring-filters #'lens--remove-lenses-from-string)
+    (add-to-list 'buffer-substring-filters #'lens-remove-lenses-from-string)
 
     (lens--refresh-buffer (point) (+ (point) (length insert)))))
 
@@ -293,8 +305,7 @@ reinserted."
                (`(,newtext ,newstate)
                 (if external (list new (funcall (plist-get display :tostate) new))
                   (list (funcall (plist-get display :totext) new) new)))
-               (newlens (list spec newtext newstate))
-               (title (funcall (or (plist-get (get spec :source) :title) #'ignore))))
+               (newlens (list spec newtext newstate)))
 
     ;; If nothing was changed, then leave the current lens as is.
     ;; Replacing the lens when it hasn't changed can lead to issues
@@ -338,21 +349,24 @@ reinserted."
 
     (lens--refresh-buffer hb (+ hb (length replace)))))
 
-(defun lens-remove-all (&optional before)
-  "Remove all lenses in the current buffer.
+(defun lens-run-on-all (func &optional noerror)
+  "Run FUNC on all lenses in the buffer.
 
-BEFORE is a function that will be called before removing each
-lens. It should have 1 argument, the lens being removed."
-  (interactive)
+FUNC will be called with one argument, the region of the lens. If
+NOERROR is non-nil, demote errors thrown by FUNC to messages."
   (let (region)
     (save-excursion
       (goto-char (point-min))
       (while (setq region (lens-search-forward))
-        (condition-case err (when before (funcall before (car region)))
-          (error (message "Error in remove lens hook: %s" (cadr err))))
-        (lens-remove region)))))
+        (condition-case err (funcall func region)
+          (error (unless noerror (message "Error in `lens-run-on-all': %s" (cadr err)))))))))
 
-(defun lens--remove-lenses-from-string (string)
+(defun lens-remove-all ()
+  "Remove all lenses in the current buffer."
+  (interactive)
+  (lens-run-on-all #'lens-remove t))
+
+(defun lens-remove-lenses-from-string (string)
   "Return STRING with all lenses removed."
 
   ;; If the string contains the beginning or end of a lens, then remove lenses
@@ -372,19 +386,28 @@ lens. It should have 1 argument, the lens being removed."
 
 (defvar-local lens--presave nil
   "Stores the buffer contents before removing the lenses.
-Should be nil or a plist of the form (:text TEXT :pos POINT)")
+Should be nil or a plist of the form:
+\(:text TEXT :pos POINT :overlays OVERLAYS)")
 
 (defun lens--before-save ()
   "Remove lenses from the buffer before saving."
   (when (text-property-not-all (point-min) (point-max) 'lens-begin nil)
-    (setq lens--presave (list :text (buffer-string) :pos (point)))
+    (setq lens--presave
+          (list :text (buffer-string) :pos (point)
+                :overlays (--map (list (overlay-start it) (overlay-end it) (overlay-properties it))
+                                 (overlays-in (point-min) (point-max)))))
     (add-hook 'after-save-hook #'lens--after-save-once nil 'local)
-    (lens-remove-all
-     (when lens-save-lenses-on-save
-       '(lambda (lens)
-          (let ((text (cadr lens)) (src (get (car lens) :source)))
-            (funcall (plist-get src :update) text)
-            (funcall (or (plist-get src :save) #'ignore) text)))))))
+
+    (when lens-save-lenses-on-save
+      (lens-run-on-all
+       (lambda (region)
+         (let* ((lens (car region))
+                (text (cadr lens))
+                (src (get (car lens) :source)))
+           (funcall (plist-get src :update) text)
+           (funcall (or (plist-get src :save) #'ignore) text)))
+       :noerror))
+    (lens-remove-all)))
 
 (defun lens--after-save-once ()
   "After saving, restore the lenses to the buffer."
@@ -392,13 +415,18 @@ Should be nil or a plist of the form (:text TEXT :pos POINT)")
     (lens-silent-edit
      (remove-overlays (point-min) (point-max))
      (delete-region (point-min) (point-max))
-     (insert (plist-get lens--presave :text)))
+     (insert (plist-get lens--presave :text))
+     (dolist (old (plist-get lens--presave :overlays))
+       (let ((o (make-overlay (car old) (cadr old)))
+             (ps (caddr old)))
+         (while ps (overlay-put o (pop ps) (pop ps))))))
     (goto-char (plist-get lens--presave :pos))
 
     (remove-hook 'after-save-hook #'lens--after-save-once 'local)
     (setq lens--presave nil)
 
     (set-buffer-modified-p nil)))
+
 
 
 ;;; Some Sources and Displays
@@ -417,7 +445,6 @@ buffer, but should not be included in the lens text."
 
 ;;;; Buffer Source
 
-(defvar-local lens--buffer-referencers nil "List of lens buffers that reference the current buffer")
 (defun lens--add-buffer-referencer (source-buf lens-buf)
   "Mark LENS-BUF as having a lens which references SOURCE-BUF."
   (with-current-buffer source-buf
@@ -478,7 +505,7 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
         :replace
         (lambda (_text) (or replaced ""))
         :save
-        (lambda (text)
+        (lambda (_text)
           (with-current-buffer buf (when buffer-file-name (save-buffer))))
         :title (lambda () (buffer-name buf))))
 
@@ -559,7 +586,6 @@ and then the ONCHANGE function will be called."
             (propertize text 'modification-hooks hooks 'insert-behind-hooks hooks)
             (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
 
-(defvar lens--modified-fields nil "List of (:buffer BUF :pos MARKER :undo? BOOL)")
 (defun lens--field-modification-hook (beg _end)
   "Mark the field starting at BEG as modified."
 
