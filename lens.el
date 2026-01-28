@@ -194,8 +194,8 @@ changed, ensuring that it stores the new lens value."
   (let* ((insert-fn (plist-get (get (car lens) :display) :insert))
          ;; Catch display errors if `lens-catch-display-errors' is non-nil
          (inside (if (not lens-catch-display-errors)
-                     (funcall insert-fn (car lens) (copy-tree (caddr lens)))
-                   (condition-case err (funcall insert-fn (car lens) (copy-tree (caddr lens)))
+                     (funcall insert-fn (car lens) (caddr lens))
+                   (condition-case err (funcall insert-fn (car lens) (caddr lens))
                      (error (propertize (format "\nError on insert: %s\n" err)
                                         'face 'error 'font-lock-face 'error)))))
          (hs (lens--generate-headers lens))
@@ -717,8 +717,8 @@ callback to call after interactions with the ui."
     (`(box ,text ,onchange . ,plist)
      (lens--field text
                   (lambda (new)
-                    (funcall (or onchange #'ignore) new)
-                    (funcall cb (plist-get plist :refresh)))
+                    (funcall cb (or onchange #'ignore) (list new)
+                             (plist-get plist :refresh)))
                   "[begin box]\n" "\n[end box]"))
 
     (`(row . ,cols)
@@ -734,8 +734,8 @@ callback to call after interactions with the ui."
     (`(button ,label ,onclick . ,plist)
      (propertize (format " %s " label) 'lens-click
                  (lambda ()
-                   (funcall (or onclick #'ignore))
-                   (funcall cb (not (plist-get plist :norefresh))))
+                   (funcall cb (or onclick #'ignore) ()
+                            (not (plist-get plist :norefresh))))
                  'local-map (list 'keymap lens-button-keymap (current-local-map))
                  'font-lock-face (or (plist-get plist :face) 'lens-button)
                  'read-only t))))
@@ -760,13 +760,16 @@ UI is a plist with properties :tostate, :totext, and :toui."
     (list :tostate tostate
           :totext totext
           :insert
-          (lambda (spec state-copy)
+          (lambda (spec state)
             (lens--ui-to-string
-             (funcall toui state-copy)
-             (lambda (&optional refresh)
-               (let ((region (lens-at-point)))
+             (funcall toui state)
+             (lambda (mutator mutator-args &optional refresh)
+               (message "CB: %s" refresh)
+               (let* ((region (lens-at-point))
+                      (new-state (copy-tree (caddr (car region)))))
                  (unless (eq (caar region) spec) (error "Incorrect lens at point"))
-                 (lens-modify region state-copy nil (not refresh)))))))))
+                 (apply mutator new-state mutator-args)
+                 (lens-modify region new-state nil (not refresh)))))))))
 
 
 ;;; Usable functions
@@ -1047,7 +1050,7 @@ all overlays."
   :toui
   (lambda (st)
     `((box ,(plist-get st :text)
-           ,(@1 (plist-put st :text @1))))))
+           ,(@2 (plist-put @1 :text @2))))))
 
 (lens-defui test
   :tostate
@@ -1063,12 +1066,12 @@ all overlays."
   (lambda (st)
     ;; (message ">>%s" st)
     `((row
-       (button "/2" ,(@0 (=> (plist-get st :count) / 2)))
-       (button "-" ,(@0 (=> (plist-get st :count) - 1)))
+       (button "/2" ,(@1 (=> (plist-get @1 :count) / 2)))
+       (button "-" ,(@1 (=> (plist-get @1 :count) - 1)))
        ,(format "#%s" (plist-get st :count))
-       (button "+" ,(@0 (=> (plist-get st :count) + 1)))
-       (button "x2" ,(@0 (=> (plist-get st :count) * 2))))
+       (button "+" ,(@1 (=> (plist-get @1 :count) + 1)))
+       (button "x2" ,(@1 (=> (plist-get @1 :count) * 2))))
       (box ,(plist-get st :rest)
-           ,(@1 (plist-put st :rest @1))))))
+           ,(@2 (plist-put @1 :rest @2))))))
 
 ;; (lens-insert (lens-buffer-source (get-buffer "temp2.org")) (lens-raw-display))
