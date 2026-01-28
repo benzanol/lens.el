@@ -1,9 +1,10 @@
 ;;; lens.el -*- lexical-binding: t; -*-
 
-(require 'f)
 (require 'dash)
+(require 'f)
 (require 'org)
 (require 'text-property-search)
+
 
 ;;; Variables
 ;;;; User Variables
@@ -192,9 +193,11 @@ changed, ensuring that it stores the new lens value."
 
   (let* ((insert-fn (plist-get (get (car lens) :display) :insert))
          ;; Catch display errors if `lens-catch-display-errors' is non-nil
-         (inside (condition-case err (funcall insert-fn (car lens) (copy-tree (caddr lens)))
-                   (error (unless lens-catch-display-errors (error err))
-                          (propertize (format "\n%s\n" err) 'face 'error 'font-lock-face 'error))))
+         (inside (if (not lens-catch-display-errors)
+                     (funcall insert-fn (car lens) (copy-tree (caddr lens)))
+                   (condition-case err (funcall insert-fn (car lens) (copy-tree (caddr lens)))
+                     (error (propertize (format "\nError on insert: %s\n" err)
+                                        'face 'error 'font-lock-face 'error)))))
          (hs (lens--generate-headers lens))
          (style (get (car lens) :style)))
 
@@ -284,10 +287,15 @@ face, as it will trample all other faces in the region."
     ;; Before save
     (add-hook 'before-save-hook #'lens--before-save nil 'local)
     ;; Buffer substring filter
-    (make-local-variable 'buffer-substring-filters)
-    (add-to-list 'buffer-substring-filters #'lens-remove-lenses-from-string)
+    (make-local-variable 'filter-buffer-substring-functions)
+    (add-to-list 'filter-buffer-substring-functions #'lens--filter-buffer-substring-function)
 
     (lens--refresh-buffer (point) (+ (point) (length insert)))))
+
+(defun lens--filter-buffer-substring-function (func beg end &optional delete)
+  "Remove lenses from the region"
+  (let ((str (funcall func beg end delete)))
+    (or (ignore-errors (lens-remove-lenses-from-string str)) str)))
 
 
 ;;;; Modifying
@@ -432,7 +440,6 @@ Should be nil or a plist of the form:
     (setq lens--presave nil)
 
     (set-buffer-modified-p nil)))
-
 
 
 ;;; Some Sources and Displays
@@ -674,10 +681,11 @@ and returns the new value of the text data."
 
 (defun lens-string-width (str)
   "Calculate the pixel width of a string STR."
-  (if (boundp #'string-pixel-width)
-      (/ (string-pixel-width str) (string-pixel-width "a"))
-    (require 'shr)
-    (/ (shr-string-pixel-width str) (shr-string-pixel-width "a"))))
+  (let ((inhibit-read-only t))
+    (if (boundp #'string-pixel-width)
+        (/ (string-pixel-width str) (string-pixel-width "a"))
+      (require 'shr)
+      (/ (shr-string-pixel-width str) (shr-string-pixel-width "a")))))
 
 (defun lens--join-columns (cols &optional sep)
   "Vertically align a list of strings as columns.
@@ -817,7 +825,7 @@ UI is a plist with properties :tostate, :totext, and :toui."
 
   (let* ((rel1 (f-relative path (f-parent buffer-file-name)))
          (rel (if (string-match-p "\\`[/~]" rel1) rel1 (concat "./" rel1)))
-         (link (format "[[%s]]" rel)))
+         (link (format "[[%s]]\n" rel)))
     (mkdir (f-parent path) t)
     (f-touch path)
     (find-file-noselect path t)
@@ -1026,17 +1034,34 @@ all overlays."
 
 ;; (setq lens-default-style nil)
 
+
 ;;; UIs
+
+(lens-defui raw
+  :tostate
+  (lambda (text)
+    (list :text text))
+  :totext
+  (lambda (st)
+    (plist-get st :text))
+  :toui
+  (lambda (st)
+    `((box ,(plist-get st :text)
+           ,(@1 (plist-put st :text @1))))))
+
 (lens-defui test
   :tostate
   (lambda (text)
-    (list :count (length (car (split-string text "\n")))
-          :rest (s-join "\n" (cdr (split-string text "\n")))))
+    (if (string-match-p "\\`-+$" text)
+        (list :count (length (car (split-string text "\n")))
+              :rest (s-join "\n" (cdr (split-string text "\n"))))
+      (list :count 0 :rest text)))
   :totext
   (lambda (st)
     (concat (make-string (max 0 (plist-get st :count)) ?-) "\n" (plist-get st :rest)))
   :toui
   (lambda (st)
+    ;; (message ">>%s" st)
     `((row
        (button "/2" ,(@0 (=> (plist-get st :count) / 2)))
        (button "-" ,(@0 (=> (plist-get st :count) - 1)))
