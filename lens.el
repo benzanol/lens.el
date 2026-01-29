@@ -665,7 +665,82 @@ and returns the new value of the text data."
         :insert #'lens--raw-display-insert))
 
 
+;;; Ui
 ;;;; Generating Uis
+
+(defun lens--ui-element-to-string (elem cb)
+  "Helper function for `lens--ui-to-string'.
+
+ELEM is the ui element to convert to a string, and CB is the
+callback to call after interactions with the ui."
+
+  ;; Use a string as a shorthand for the 'string component
+  (when (stringp elem) (setq elem (list 'string elem)))
+
+  (let ((component-fn (or (get (car elem) 'lens-component)
+                          (error "Not a component: %s" (car elem)))))
+    (apply component-fn cb (cdr elem))))
+
+(defun lens--ui-to-string (rows cb)
+  "Convert the ui defined by ROWS to an insertable string.
+
+ROWS is a list of ui elements, and CB is the callback to call
+after interactions with the ui."
+  (let ((row-strs (--map (lens--ui-element-to-string it cb) rows))
+        (newline (propertize "\n" 'read-only t)))
+    (concat newline (string-join row-strs newline) newline)))
+
+(defun lens-ui-display (ui)
+  "Display spec for custom ui definitions.
+
+UI is a plist with properties :tostate, :totext, and :toui."
+  (-let [(&plist :tostate tostate :totext totext :toui toui) ui]
+    (list :tostate tostate
+          :totext totext
+          :insert
+          (lambda (spec state)
+            (lens--ui-to-string
+             (funcall toui state)
+             (lambda (mutator mutator-args &optional refresh)
+               (message "CB: %s" refresh)
+               (let* ((region (lens-at-point))
+                      (new-state (copy-tree (caddr (car region)))))
+                 (unless (eq (caar region) spec) (error "Incorrect lens at point"))
+                 (apply mutator new-state mutator-args)
+                 (lens-modify region new-state nil (not refresh)))))))))
+
+
+;;;; Components
+
+(defmacro lens-defcomponent (name arglist &rest body)
+  "Define a UI component"
+  (declare (indent 2))
+
+  ;; Parse the beginning of the body as properties
+  (let ((props nil))
+    (while (keywordp (car body))
+      (push (cons (pop body) (pop body)) props))
+
+    (apply #'list #'progn
+           `(put ',name 'lens-component (lambda ,arglist . ,body))
+           (--map `(put ',(intern (concat "lens-component-"
+                                          (substring (symbol-name (car it)) 1)))
+                        ,(cdr it))
+                  props))))
+
+(lens-defcomponent box (cb text onchange &rest plist)
+  (lens--field text
+               (lambda (new)
+                 (funcall cb (or onchange #'ignore) (list new)
+                          (plist-get plist :refresh)))
+               "[begin box]\n" "\n[end box]"))
+
+(lens-defcomponent string (cb str)
+  (propertize (if (stringp str) str (string-join str "\n"))
+              'read-only t))
+
+
+;;;; Button
 
 (bz/face lens-button custom-button)
 (bz/keys lens-button-keymap
@@ -678,6 +753,18 @@ and returns the new value of the text data."
   (let ((click (get-text-property (point) 'lens-click)))
     (if click (funcall click)
       (error "Nothing to click"))))
+
+(lens-defcomponent button (cb label onclick &rest plist)
+  (propertize (format " %s " label) 'lens-click
+              (lambda ()
+                (funcall cb (or onclick #'ignore) ()
+                         (not (plist-get plist :norefresh))))
+              'local-map (list 'keymap lens-button-keymap (current-local-map))
+              'font-lock-face (or (plist-get plist :face) 'lens-button)
+              'read-only t))
+
+
+;;;; Column
 
 (defun lens-string-width (str)
   "Calculate the pixel width of a string STR."
@@ -708,70 +795,16 @@ string to insert between the columns."
                       (make-string (- max-w (lens-string-width cell-text)) ?\s)))))
     (string-join lines (propertize "\n" 'read-only t))))
 
-(defun lens--ui-element-to-string (elem cb)
-  "Helper function for `lens--ui-to-string'.
-
-ELEM is the ui element to convert to a string, and CB is the
-callback to call after interactions with the ui."
-  (pcase elem
-    (`(box ,text ,onchange . ,plist)
-     (lens--field text
-                  (lambda (new)
-                    (funcall cb (or onchange #'ignore) (list new)
-                             (plist-get plist :refresh)))
-                  "[begin box]\n" "\n[end box]"))
-
-    (`(row . ,cols)
-     (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
-                         (propertize " " 'read-only t)))
-
-    ;; Elements that are also valid columns
-
-    ((or `(string ,str) (and (pred stringp) str))
-     (propertize (if (stringp str) str (string-join str "\n"))
-                 'read-only t))
-
-    (`(button ,label ,onclick . ,plist)
-     (propertize (format " %s " label) 'lens-click
-                 (lambda ()
-                   (funcall cb (or onclick #'ignore) ()
-                            (not (plist-get plist :norefresh))))
-                 'local-map (list 'keymap lens-button-keymap (current-local-map))
-                 'font-lock-face (or (plist-get plist :face) 'lens-button)
-                 'read-only t))))
-
-(defun lens--ui-to-string (rows cb)
-  "Convert the ui defined by ROWS to an insertable string.
-
-ROWS is a list of ui elements, and CB is the callback to call
-after interactions with the ui."
-  (let ((row-strs (--map (lens--ui-element-to-string it cb) rows))
-        (newline (propertize "\n" 'read-only t)))
-    (concat newline (string-join row-strs newline) newline)))
+(lens-defcomponent row (cb &rest cols)
+  ;; Ensure that all are valid columns
+  (dolist (elem cols)
+    (unless (get (car elem) 'lens-component-can-be-column)
+      (error "Invalid column component: %s" (car elem))))
+  (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
+                      (propertize " " 'read-only t)))
 
 
-;;;; Ui Display
-
-(defun lens-ui-display (ui)
-  "Display spec for custom ui definitions.
-
-UI is a plist with properties :tostate, :totext, and :toui."
-  (-let [(&plist :tostate tostate :totext totext :toui toui) ui]
-    (list :tostate tostate
-          :totext totext
-          :insert
-          (lambda (spec state)
-            (lens--ui-to-string
-             (funcall toui state)
-             (lambda (mutator mutator-args &optional refresh)
-               (message "CB: %s" refresh)
-               (let* ((region (lens-at-point))
-                      (new-state (copy-tree (caddr (car region)))))
-                 (unless (eq (caar region) spec) (error "Incorrect lens at point"))
-                 (apply mutator new-state mutator-args)
-                 (lens-modify region new-state nil (not refresh)))))))))
-
-
+;;;; Ui functions
 ;;; Usable functions
 ;;;; Ui Functions
 
