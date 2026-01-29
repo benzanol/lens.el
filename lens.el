@@ -194,8 +194,8 @@ changed, ensuring that it stores the new lens value."
   (let* ((insert-fn (plist-get (get (car lens) :display) :insert))
          ;; Catch display errors if `lens-catch-display-errors' is non-nil
          (inside (if (not lens-catch-display-errors)
-                     (funcall insert-fn (car lens) (caddr lens))
-                   (condition-case err (funcall insert-fn (car lens) (caddr lens))
+                     (funcall insert-fn (caddr lens))
+                   (condition-case err (funcall insert-fn (caddr lens))
                      (error (propertize (format "\nError on insert: %s\n" err)
                                         'face 'error 'font-lock-face 'error)))))
          (hs (lens--generate-headers lens))
@@ -307,8 +307,9 @@ EXTERNAL specifies if the new value provided was a new text
 value, rather than a new state value. In this case, don't call
 the update function (the new text is already saved).
 
-NOREFRESH indicates that only the header and footer should be
-reinserted."
+If NOREFRESH is t, only the header and footer should be reinserted. If
+NOREFRESH is a (lambda (OLDSTATE NEWSTATE HE FB)), then use that function to
+reinsert the lens content."
   (pcase-let* ((`((,spec ,oldtext ,oldstate) ,hb ,he ,fb ,fe) region)
                (display (get spec :display))
                (source (get spec :source))
@@ -335,9 +336,11 @@ reinserted."
               (goto-char fb) (delete-region fb fe) (insert (cdr strs))
               (lens--refresh-buffer fb (point))
               (goto-char hb) (delete-region hb he) (insert (car strs))
-              (lens--refresh-buffer hb (point)))
+              (lens--refresh-buffer hb (point))
+              (when (functionp norefresh)
+                (funcall norefresh oldstate newstate he fb)))
 
-          ;; Reinsert only the entire lens
+          ;; Reinsert the entire lens
           (let ((insert (lens--generate-insert-text newlens)))
             (delete-region hb fe)
             (insert insert)
@@ -567,7 +570,7 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
         :title (lambda () (f-relative file default-directory))))
 
 
-;;;; Raw display
+;;;; Fields
 
 (bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
 (defun lens--field (text onchange &optional head foot)
@@ -640,6 +643,8 @@ the previous command, as described in `lens--field'."
                (lens--refresh-buffer hb fe)))))))))
 
 
+;;;; Raw display
+
 (defun lens--raw-display-onchange (text)
   "Value of onchange for `lens--field' used by `lens-raw-display'.
 
@@ -647,7 +652,7 @@ TEXT is the new text of the field."
   (let ((region (lens-at-point)))
     (lens-modify region text nil :norefresh)))
 
-(defun lens--raw-display-insert (_spec state)
+(defun lens--raw-display-insert (state)
   "Generate the content for a raw display with state STATE."
   (let ((field (lens--field state #'lens--raw-display-onchange "\n" "\n")))
     (lens--make-sticky field :before :after)))
@@ -666,48 +671,166 @@ and returns the new value of the text data."
 
 
 ;;; Ui
+;;;; Diffing algorithm
+
+(defun lens--ui-diff (old-list new-list)
+  "Diff OLD-LIST and NEW-LIST of UI elements using Myers algorithm.
+Each element is (ELEM TEXT HASH).
+Returns a list of (:keep TEXT), (:insert TEXT), or (:delete TEXT)."
+  (let* ((n (length old-list))
+         (m (length new-list))
+         (max-d (+ n m))
+         (old-vec (vconcat old-list))
+         (new-vec (vconcat new-list))
+         (v-offset (1+ max-d))
+         (v (make-vector (+ (* 2 max-d) 3) 0))
+         (trace '())
+         (final-d 0))
+
+    (cond
+     ((and (= n 0) (= m 0)) '())
+     ((= n 0) (mapcar (lambda (e) (list :insert nil (cdr e))) new-list))
+     ((= m 0) (mapcar (lambda (e) (cons :delete (cdr e) nil)) old-list))
+     (t
+      ;; Forward pass
+      (catch 'found
+        (dotimes (d (1+ max-d))
+          (push (copy-sequence v) trace)
+          (let ((k (- d)))
+            (while (<= k d)
+              (let* ((go-down (or (= k (- d))
+                                  (and (/= k d)
+                                       (< (aref v (+ v-offset k -1))
+                                          (aref v (+ v-offset k 1))))))
+                     (x (if go-down
+                            (aref v (+ v-offset k 1))
+                          (1+ (aref v (+ v-offset k -1)))))
+                     (y (- x k)))
+                (while (and (< x n) (< y m)
+                            (let ((o (aref old-vec x))
+                                  (w (aref new-vec y)))
+                              (and (equal (cdar o) (cdar w))
+                                   (equal (caar o) (caar w)))))
+                  (setq x (1+ x) y (1+ y)))
+                (aset v (+ v-offset k) x)
+                (when (and (>= x n) (>= y m))
+                  (setq final-d d)
+                  (throw 'found t)))
+              (setq k (+ k 2))))))
+
+      ;; Backtrack
+      (let ((x n)
+            (y m)
+            (edits '()))
+        ;; Walk back through each edit step
+        (let ((d final-d))
+          (while (> d 0)
+            (let* ((v-prev (nth (- final-d d) trace))
+                   (k (- x y))
+                   (go-down (or (= k (- d))
+                                (and (/= k d)
+                                     (< (aref v-prev (+ v-offset k -1))
+                                        (aref v-prev (+ v-offset k 1))))))
+                   (prev-k (if go-down (1+ k) (1- k)))
+                   (prev-x (aref v-prev (+ v-offset prev-k)))
+                   (prev-y (- prev-x prev-k)))
+              ;; Record diagonal matches (in reverse)
+              (while (and (> x prev-x) (> y prev-y))
+                (setq x (1- x) y (1- y))
+                (push (list :keep (cdr (aref old-vec x)) (cdr (aref new-vec y))) edits))
+              ;; Record the edit
+              (if go-down
+                  (progn (setq y (1- y))
+                         (push (list :insert nil (cdr (aref new-vec y))) edits))
+                (setq x (1- x))
+                (push (list :delete (cdr (aref old-vec x)) nil) edits)))
+            (setq d (1- d))))
+        ;; Handle initial diagonal (d=0 matches)
+        (while (and (> x 0) (> y 0))
+          (setq x (1- x) y (1- y))
+          (push (list :keep (cdr (aref old-vec x)) (cdr (aref new-vec y))) edits))
+        edits)))))
+
+
 ;;;; Generating Uis
 
-(defun lens--ui-element-to-string (elem cb)
-  "Helper function for `lens--ui-to-string'.
+(defun lens--generate-ui-element (elem cb)
+  "Generates a single ui element by applying the component to the args.
 
-ELEM is the ui element to convert to a string, and CB is the
-callback to call after interactions with the ui."
+ELEM is (COMPONENT ARGS...). CB is the update callback.
+
+Returns (ELEM STRING HASH)"
 
   ;; Use a string as a shorthand for the 'string component
   (when (stringp elem) (setq elem (list 'string elem)))
 
-  (let ((component-fn (or (get (car elem) 'lens-component)
-                          (error "Not a component: %s" (car elem)))))
-    (apply component-fn cb (cdr elem))))
+  (let* ((component-fn (or (get (car elem) 'lens-component)
+                           (error "Not a component: %s" (car elem))))
+         (str (apply component-fn cb (cdr elem)))
+         (elem-id (abs (random))))
+    (cons (cons elem (sxhash elem))
+          (cons elem-id (propertize str 'lens-element-id elem-id)))))
 
-(defun lens--ui-to-string (rows cb)
-  "Convert the ui defined by ROWS to an insertable string.
+(defun lens--ui-renderer (old-state new-state he fb)
+  (let* ((old-ui (plist-get old-state :ui))
+         (new-ui (plist-get new-state :ui))
+         (diff (lens--ui-diff old-ui new-ui)))
+    (save-excursion
+      (goto-char (1+ he))
+      (pcase-dolist (`(,action ,old ,new) diff)
+        (if (eq action :insert)
+            (insert (cdr new) (propertize "\n" 'read-only t))
+          (let ((start (prog1 (point) (forward-char -1)))
+                (match (text-property-search-forward 'lens-element-id (car old) #'eq t))
+                m)
+            (cl-assert (and match (eq (prop-match-beginning match) start)))
+            ;; Pursue the match
+            (while (setq m (text-property-search-forward 'lens-element-id (car old) #'eq t))
+              (setq match m))
 
-ROWS is a list of ui elements, and CB is the callback to call
-after interactions with the ui."
-  (let ((row-strs (--map (lens--ui-element-to-string it cb) rows))
-        (newline (propertize "\n" 'read-only t)))
-    (concat newline (string-join row-strs newline) newline)))
+            (forward-char 1)
+            (if (eq action :delete) (delete-region start (point))
+              (put-text-property start (1- (point)) 'lens-element-id (car new)))))))))
+
+(defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args)
+  (let* ((region (lens-at-point))
+         (state (caddr (car region)))
+         (new-state (apply #'list state))
+         generated)
+
+    (unless (eq (plist-get (caddr (car region)) :ui-id) ui-id) (error "Incorrect lens at point"))
+
+    ;; Copy the internal state
+    (plist-put new-state :state (copy-tree (plist-get new-state :state)))
+    ;; Apply the mutator
+    (apply mutator (plist-get new-state :state) mutator-args)
+    ;; Generate the new ui
+    (let* ((cb (lambda (mut &rest mut-args) (lens--ui-callback-for-lens ui-id toui mut mut-args)))
+           (ui (funcall toui (plist-get new-state :state)))
+           (generated (--map (lens--generate-ui-element it cb) ui)))
+      (plist-put new-state :ui generated)
+
+      ;; Apply modifications
+      (lens-modify region new-state nil #'lens--ui-renderer))))
 
 (defun lens-ui-display (ui)
   "Display spec for custom ui definitions.
 
 UI is a plist with properties :tostate, :totext, and :toui."
-  (-let [(&plist :tostate tostate :totext totext :toui toui) ui]
-    (list :tostate tostate
-          :totext totext
+  (-let (((&plist :tostate tostate :totext totext :toui toui) ui)
+         (ui-id (abs (random))))
+
+    (list :tostate
+          (lambda (text)
+            (let* ((state (funcall tostate text))
+                   (ui (funcall toui state))
+                   (cb (lambda (mut &rest mut-args) (lens--ui-callback-for-lens ui-id toui mut mut-args)))
+                   (generated (--map (lens--generate-ui-element it cb) ui)))
+              (list :state state :ui-id ui-id :ui generated)))
+          :totext (lambda (state) (funcall totext (plist-get state :state)))
           :insert
-          (lambda (spec state)
-            (lens--ui-to-string
-             (funcall toui state)
-             (lambda (mutator mutator-args &optional refresh)
-               (message "CB: %s" refresh)
-               (let* ((region (lens-at-point))
-                      (new-state (copy-tree (caddr (car region)))))
-                 (unless (eq (caar region) spec) (error "Incorrect lens at point"))
-                 (apply mutator new-state mutator-args)
-                 (lens-modify region new-state nil (not refresh)))))))))
+          (lambda (state)
+            (concat "\n" (mapconcat #'cddr (plist-get state :ui) "\n"))))))
 
 
 ;;;; Components
@@ -721,9 +844,10 @@ UI is a plist with properties :tostate, :totext, and :toui."
     (while (keywordp (car body))
       (push (cons (pop body) (pop body)) props))
 
-    (apply #'list #'progn
+    (apply #'list #'prog1
            `(put ',name 'lens-component (lambda ,arglist . ,body))
-           (--map `(put ',(intern (concat "lens-component-"
+           (--map `(put ',name
+                        ',(intern (concat "lens-component-"
                                           (substring (symbol-name (car it)) 1)))
                         ,(cdr it))
                   props))))
@@ -731,11 +855,11 @@ UI is a plist with properties :tostate, :totext, and :toui."
 (lens-defcomponent box (cb text onchange &rest plist)
   (lens--field text
                (lambda (new)
-                 (funcall cb (or onchange #'ignore) (list new)
-                          (plist-get plist :refresh)))
+                 (funcall cb (or onchange #'ignore) new))
                "[begin box]\n" "\n[end box]"))
 
 (lens-defcomponent string (cb str)
+  :can-be-column t
   (propertize (if (stringp str) str (string-join str "\n"))
               'read-only t))
 
@@ -755,10 +879,10 @@ UI is a plist with properties :tostate, :totext, and :toui."
       (error "Nothing to click"))))
 
 (lens-defcomponent button (cb label onclick &rest plist)
+  :can-be-column t
   (propertize (format " %s " label) 'lens-click
               (lambda ()
-                (funcall cb (or onclick #'ignore) ()
-                         (not (plist-get plist :norefresh))))
+                (funcall cb (or onclick #'ignore)))
               'local-map (list 'keymap lens-button-keymap (current-local-map))
               'font-lock-face (or (plist-get plist :face) 'lens-button)
               'read-only t))
@@ -798,7 +922,8 @@ string to insert between the columns."
 (lens-defcomponent row (cb &rest cols)
   ;; Ensure that all are valid columns
   (dolist (elem cols)
-    (unless (get (car elem) 'lens-component-can-be-column)
+    (unless (or (stringp elem)
+                (get (car elem) 'lens-component-can-be-column))
       (error "Invalid column component: %s" (car elem))))
   (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
                       (propertize " " 'read-only t)))
