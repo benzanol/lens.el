@@ -32,11 +32,35 @@ redisplay will be cancelled.")
 
 
 ;;; Utilities
+;;;; Ui element at point
+
+(defun lens--ui-element-at-point ()
+  (save-excursion
+    (let* ((start (point))
+           (me (text-property-search-forward 'lens-element-id))
+           (id (and me (prop-match-value me)))
+           m ms)
+
+      (when id
+        ;; Get the latest region
+        (while (setq m (text-property-search-forward 'lens-element-id id #'eq))
+          (setq me m))
+        ;; Get the earliest region
+        (goto-char (prop-match-beginning me))
+        (while (setq m (text-property-search-backward 'lens-element-id id #'eq))
+          (setq ms m))
+        (let ((beg (prop-match-beginning ms))
+              (end (prop-match-end ms)))
+          (when (<= beg start)
+            (list id beg end)))))))
+
+
 ;;;; Utils
 
 (defmacro lens-save-position (&rest body)
   "Save the line and column of the cursor when executing BODY."
-  `(let* ((line (line-number-at-pos)) (col (current-column)))
+  `(let* ((line (line-number-at-pos)) (col (current-column))
+          (ui-elem (lens--ui-element-at-point)))
      ,@body
      (goto-char (point-min))
      (forward-line (1- line))
