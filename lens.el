@@ -32,29 +32,6 @@ redisplay will be cancelled.")
 
 
 ;;; Utilities
-;;;; Ui element at point
-
-(defun lens--ui-element-at-point ()
-  (save-excursion
-    (let* ((start (point))
-           (me (text-property-search-forward 'lens-element-id))
-           (id (and me (prop-match-value me)))
-           m ms)
-
-      (when id
-        ;; Get the latest region
-        (while (setq m (text-property-search-forward 'lens-element-id id #'eq))
-          (setq me m))
-        ;; Get the earliest region
-        (goto-char (prop-match-beginning me))
-        (while (setq m (text-property-search-backward 'lens-element-id id #'eq))
-          (setq ms m))
-        (let ((beg (prop-match-beginning ms))
-              (end (prop-match-end ms)))
-          (when (<= beg start)
-            (list id beg end)))))))
-
-
 ;;;; Utils
 
 (defmacro lens-save-position (&rest body)
@@ -65,6 +42,33 @@ redisplay will be cancelled.")
      (goto-char (point-min))
      (forward-line (1- line))
      (forward-char col)))
+
+(defmacro lens-save-position-in-ui (&rest body)
+  "Save the current position relative to the containing ui element."
+  `(let* ((line (line-number-at-pos)) (col (current-column))
+          mb me id ui-key ui-line region)
+     (save-excursion
+       (and
+        (setq me (text-property-search-forward 'lens-element-key))
+        ;; If the next prop match is a start, then we weren't inside of an element
+        (not (eq (prop-match-value me) 'START))
+        (setq mb (progn (forward-char -1)
+                        (text-property-search-backward 'lens-element-key)))
+        ;; We are inside of a component, so set the relevant values
+        (setq ui-line (- line (line-number-at-pos))
+              ui-key (prop-match-value me))))
+     ,@body
+     (if (and ui-key (setq region (lens-at-point))
+              (progn (goto-char (caddr region)) ; Go to the end of the lens header
+                     ;; Go to the end of the key region
+                     (text-property-search-forward 'lens-element-key ui-key #'eq))
+              ;; Go to the beginning of the key region
+              (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
+         (progn (forward-line ui-line)
+                (forward-char col))
+       (goto-char (point-min))
+       (forward-line (1- line))
+       (forward-char col))))
 
 (defun lens--refresh-buffer (&optional beg end)
   "Called after modifying a buffer region between BEG and END."
@@ -348,7 +352,7 @@ reinsert the lens content."
     ;; Replacing the lens when it hasn't changed can lead to issues
     ;; with the undo history
     (unless (and (string= oldtext newtext) (equal oldstate newstate))
-      (lens-save-position
+      (lens-save-position-in-ui
        (lens-silent-edit
         ;; Refresh the style properties
         (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
@@ -699,8 +703,13 @@ and returns the new value of the text data."
 
 (defun lens--ui-diff (old-list new-list)
   "Diff OLD-LIST and NEW-LIST of UI elements using Myers algorithm.
-Each element is (ELEM TEXT HASH).
-Returns a list of (:keep TEXT), (:insert TEXT), or (:delete TEXT)."
+
+Each element is (ELEM . VALUE) where ELEM is what is being
+compared (using #'equal), and VALUE is what is returned.
+
+Returns a list of (:keep/:insert/:delete OLD NEW), where OLD is the old
+VALUE and NEW is the new VALUE. For :insert and :delete, one of these
+will be nil."
   (let* ((n (length old-list))
          (m (length new-list))
          (max-d (+ n m))
@@ -731,10 +740,8 @@ Returns a list of (:keep TEXT), (:insert TEXT), or (:delete TEXT)."
                           (1+ (aref v (+ v-offset k -1)))))
                      (y (- x k)))
                 (while (and (< x n) (< y m)
-                            (let ((o (aref old-vec x))
-                                  (w (aref new-vec y)))
-                              (and (equal (cdar o) (cdar w))
-                                   (equal (caar o) (caar w)))))
+                            (equal (car (aref old-vec x))
+                                   (car (aref new-vec y))))
                   (setq x (1+ x) y (1+ y)))
                 (aset v (+ v-offset k) x)
                 (when (and (>= x n) (>= y m))
@@ -781,19 +788,17 @@ Returns a list of (:keep TEXT), (:insert TEXT), or (:delete TEXT)."
 (defun lens--generate-ui-element (elem cb)
   "Generates a single ui element by applying the component to the args.
 
-ELEM is (COMPONENT ARGS...). CB is the update callback.
+ELEM is (COMPONENT KEY ARGS...). CB is the update callback.
 
-Returns (ELEM STRING HASH)"
+Returns (ELEM STRING KEY)"
 
   ;; Use a string as a shorthand for the 'string component
-  (when (stringp elem) (setq elem (list 'string elem)))
-
   (let* ((component-fn (or (get (car elem) 'lens-component)
                            (error "Not a component: %s" (car elem))))
-         (str (apply component-fn cb (cdr elem)))
-         (elem-id (abs (random))))
-    (cons (cons elem (sxhash elem))
-          (cons elem-id (propertize str 'lens-element-id elem-id)))))
+         (key (cadr elem))
+         (str (apply component-fn cb (cddr elem))))
+    (unless (keywordp key) (error "Element key must be a keyword: %s" elem))
+    (list elem str key)))
 
 (defun lens--ui-renderer (old-state new-state he fb)
   (let* ((old-ui (plist-get old-state :ui))
@@ -803,18 +808,14 @@ Returns (ELEM STRING HASH)"
       (goto-char (1+ he))
       (pcase-dolist (`(,action ,old ,new) diff)
         (if (eq action :insert)
-            (insert (cdr new) (propertize "\n" 'read-only t))
-          (let ((start (prog1 (point) (forward-char -1)))
-                (match (text-property-search-forward 'lens-element-id (car old) #'eq t))
+            (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
+          (let ((start (point))
+                ;; The match is the newline at the end of the old element
+                (match (text-property-search-forward 'lens-element-key))
                 m)
-            (cl-assert (and match (eq (prop-match-beginning match) start)))
-            ;; Pursue the match
-            (while (setq m (text-property-search-forward 'lens-element-id (car old) #'eq t))
-              (setq match m))
-
-            (forward-char 1)
-            (if (eq action :delete) (delete-region start (point))
-              (put-text-property start (1- (point)) 'lens-element-id (car new)))))))))
+            (cl-assert match)
+            (cl-assert (eq (prop-match-value match) (cadr old)))
+            (when (eq action :delete) (delete-region start (point)))))))))
 
 (defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args)
   (let* ((region (lens-at-point))
@@ -854,7 +855,11 @@ UI is a plist with properties :tostate, :totext, and :toui."
           :totext (lambda (state) (funcall totext (plist-get state :state)))
           :insert
           (lambda (state)
-            (concat "\n" (mapconcat #'cddr (plist-get state :ui) "\n"))))))
+            (string-join
+             (cons (propertize "\n" 'lens-element-key 'START)
+                   (--map (concat (cadr it)
+                                  (propertize "\n" 'lens-element-key (caddr it)))
+                          (plist-get state :ui))))))))
 
 
 ;;;; Components
@@ -953,7 +958,6 @@ string to insert between the columns."
                       (propertize " " 'read-only t)))
 
 
-;;;; Ui functions
 ;;; Usable functions
 ;;;; Ui Functions
 
