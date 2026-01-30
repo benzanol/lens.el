@@ -64,11 +64,8 @@ redisplay will be cancelled.")
                      (text-property-search-forward 'lens-element-key ui-key #'eq))
               ;; Go to the beginning of the key region
               (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
-         (progn (message "PNT %s %s %s" (point) ui-line col)
-                (forward-line ui-line)
-                (message "PNT2 %s" (point))
-                (forward-char (min col (- (pos-eol) (point))))
-                (message "PNT3 %s" (point)))
+         (progn (forward-line ui-line)
+                (forward-char (min col (- (pos-eol) (point)))))
        (goto-char (point-min))
        (forward-line (1- line))
        (forward-char (min col (- (pos-eol) (point)))))))
@@ -375,6 +372,9 @@ reinsert the lens content."
           (let ((insert (lens--generate-insert-text newlens)))
             (delete-region hb fe)
             (insert insert)
+            ;; Go back to the start of the lens so that
+            ;; lens-save-position-in-ui recognizes the current lens
+            (goto-char hb)
             (lens--refresh-buffer hb (point))))))
 
       ;; Update the data source if this was a direct modification to the lens
@@ -604,7 +604,7 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
 ;;;; Fields
 
 (bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
-(defun lens--field (text onchange &optional head foot)
+(defun lens--field (text onchange &optional head foot props)
   "Create a controlled, modifyable region of text.
 
 TEXT is the initial content of the region. ONCHANGE is a function
@@ -618,11 +618,15 @@ footer.
 Every time the field is modified, it will be marked as modified
 in `lens--modified-fields'. Then, in the `post-command-hook', the
 new region content will be edited to have the correct properties,
-and then the ONCHANGE function will be called."
+and then the ONCHANGE function will be called.
+
+PROPS is a plist of text properties that will be applied to the text of
+the field."
   (setq head (or head "---\n") foot (or foot "\n---"))
   (let* ((field (lens--make-symbol "field"))
          (hooks '(lens--field-modification-hook)))
     (fset field onchange)
+    (put field 'lens-field-props props)
     (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
 
     (dolist (prop '(face font-lock-face))
@@ -630,7 +634,9 @@ and then the ONCHANGE function will be called."
             foot (propertize foot prop 'lens-field-header)))
 
     (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
-            (propertize text 'modification-hooks hooks 'insert-behind-hooks hooks)
+            (apply #'propertize text
+                   'modification-hooks hooks 'insert-behind-hooks hooks
+                   props)
             (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
 
 (defun lens--field-modification-hook (beg _end)
@@ -667,8 +673,12 @@ the previous command, as described in `lens--field'."
                           (goto-char (plist-get plist :pos))
                           (lens--region-at-point 'field-begin 'field-end))))
              (when field
+               ;; Make sure the entire text has the correct properties
                (dolist (prop '(modification-hooks insert-behind-hooks))
                  (put-text-property he fb prop '(lens--field-modification-hook)))
+               (let ((props (get field 'lens-field-props)))
+                 (while props (put-text-property he fb (pop props) (pop props))))
+
                (funcall field (buffer-substring-no-properties he fb))
 
                (lens--refresh-buffer hb fe)))))))))
@@ -823,7 +833,7 @@ Returns (ELEM STRING KEY)"
             (cl-assert (eq (prop-match-value match) (cadr old)))
             (when (eq action :delete) (delete-region start (point)))))))))
 
-(defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args)
+(defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args norefresh)
   (let* ((region (lens-at-point))
          (state (caddr (car region)))
          (new-state (apply #'list state))
@@ -836,14 +846,14 @@ Returns (ELEM STRING KEY)"
     ;; Apply the mutator
     (apply mutator (plist-get new-state :state) mutator-args)
     ;; Generate the new ui
-    (let* ((cb (lambda (mut &rest mut-args) (lens--ui-callback-for-lens ui-id toui mut mut-args)))
+    (let* ((cb (lambda (mut &optional mut-args norefresh)
+                 (lens--ui-callback-for-lens ui-id toui mut mut-args norefresh)))
            (ui (funcall toui (plist-get new-state :state)))
            (generated (--map (lens--generate-ui-element it cb) ui)))
       (plist-put new-state :ui generated)
 
       ;; Apply modifications
-      (lens-modify region new-state nil #'lens--ui-renderer)
-      (message "%s" (point)))))
+      (lens-modify region new-state nil (or norefresh #'lens--ui-renderer)))))
 
 (defun lens-ui-display (ui)
   "Display spec for custom ui definitions.
@@ -856,7 +866,8 @@ UI is a plist with properties :tostate, :totext, and :toui."
           (lambda (text)
             (let* ((state (funcall tostate text))
                    (ui (funcall toui state))
-                   (cb (lambda (mut &rest mut-args) (lens--ui-callback-for-lens ui-id toui mut mut-args)))
+                   (cb (lambda (mut &optional mut-args norefresh)
+                         (lens--ui-callback-for-lens ui-id toui mut mut-args norefresh)))
                    (generated (--map (lens--generate-ui-element it cb) ui)))
               (list :state state :ui-id ui-id :ui generated)))
           :totext (lambda (state) (funcall totext (plist-get state :state)))
@@ -891,7 +902,7 @@ UI is a plist with properties :tostate, :totext, and :toui."
 (lens-defcomponent box (cb text onchange &rest plist)
   (lens--field text
                (lambda (new)
-                 (funcall cb (or onchange #'ignore) new))
+                 (funcall cb (or onchange #'ignore) (list new) t))
                "[begin box]\n" "\n[end box]"))
 
 (lens-defcomponent string (cb str)
