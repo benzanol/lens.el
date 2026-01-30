@@ -41,7 +41,7 @@ redisplay will be cancelled.")
      ,@body
      (goto-char (point-min))
      (forward-line (1- line))
-     (forward-char col)))
+     (forward-char (min col (- (pos-eol) (point))))))
 
 (defmacro lens-save-position-in-ui (&rest body)
   "Save the current position relative to the containing ui element."
@@ -64,11 +64,14 @@ redisplay will be cancelled.")
                      (text-property-search-forward 'lens-element-key ui-key #'eq))
               ;; Go to the beginning of the key region
               (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
-         (progn (forward-line ui-line)
-                (forward-char col))
+         (progn (message "PNT %s %s %s" (point) ui-line col)
+                (forward-line ui-line)
+                (message "PNT2 %s" (point))
+                (forward-char (min col (- (pos-eol) (point))))
+                (message "PNT3 %s" (point)))
        (goto-char (point-min))
        (forward-line (1- line))
-       (forward-char col))))
+       (forward-char (min col (- (pos-eol) (point)))))))
 
 (defun lens--refresh-buffer (&optional beg end)
   "Called after modifying a buffer region between BEG and END."
@@ -83,7 +86,7 @@ redisplay will be cancelled.")
   `(let ((inhibit-read-only t)
          (inhibit-modification-hooks t)
          (inhibit-point-motion-hooks t))
-     (save-excursion (atomic-change-group ,@body))))
+     (atomic-change-group ,@body)))
 
 (defun lens--make-symbol (name &rest props)
   "Create a custom symbol with the base name NAME.
@@ -651,8 +654,6 @@ the previous command, as described in `lens--field'."
     (dolist (plist (prog1 lens--modified-fields (setq lens--modified-fields nil)))
       (with-current-buffer (plist-get plist :buffer)
         (lens-silent-edit
-         (goto-char (plist-get plist :pos))
-
          (if (plist-get plist :undo)
              ;; If it was an undo action, we only need to update the restored lens
              (pcase-let ((`(,lens ,_hb ,_he ,_fb ,_fe) (lens-at-point t)))
@@ -661,11 +662,13 @@ the previous command, as described in `lens--field'."
                  (funcall (plist-get (get (car lens) :source) :update) (cadr lens))))
 
            ;; Perform the procedure in case there was a proper modification
-           (pcase-let ((`(,field ,hb ,he ,fb ,fe) (lens--region-at-point 'field-begin 'field-end)))
+           (pcase-let ((`(,field ,hb ,he ,fb ,fe)
+                        (save-excursion
+                          (goto-char (plist-get plist :pos))
+                          (lens--region-at-point 'field-begin 'field-end))))
              (when field
                (dolist (prop '(modification-hooks insert-behind-hooks))
                  (put-text-property he fb prop '(lens--field-modification-hook)))
-               (goto-char he)
                (funcall field (buffer-substring-no-properties he fb))
 
                (lens--refresh-buffer hb fe)))))))))
@@ -811,9 +814,7 @@ Returns (ELEM STRING KEY)"
       (goto-char (1+ he))
       (pcase-dolist (`(,action ,old ,new) diff)
         (if (eq action :insert)
-            (insert (car new) (propertize "\n" 'read-only t
-                                          'lens-element-key (cadr new)
-                                          'rear-nonsticky t))
+            (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
           (let ((start (point))
                 ;; The match is the newline at the end of the old element
                 (match (text-property-search-forward 'lens-element-key))
@@ -841,7 +842,8 @@ Returns (ELEM STRING KEY)"
       (plist-put new-state :ui generated)
 
       ;; Apply modifications
-      (lens-modify region new-state nil #'lens--ui-renderer))))
+      (lens-modify region new-state nil #'lens--ui-renderer)
+      (message "%s" (point)))))
 
 (defun lens-ui-display (ui)
   "Display spec for custom ui definitions.
@@ -861,7 +863,7 @@ UI is a plist with properties :tostate, :totext, and :toui."
           :insert
           (lambda (state)
             (string-join
-             (cons (propertize "\n" 'lens-element-key 'START 'rear-nonsticky t)
+             (cons (propertize "\n" 'lens-element-key 'START)
                    (--map (concat (cadr it)
                                   (propertize "\n" 'lens-element-key (caddr it)))
                           (plist-get state :ui))))))))
@@ -956,8 +958,7 @@ string to insert between the columns."
 (lens-defcomponent row (cb &rest cols)
   ;; Ensure that all are valid columns
   (dolist (elem cols)
-    (unless (or (stringp elem)
-                (get (car elem) 'lens-component-can-be-column))
+    (unless (get (car elem) 'lens-component-can-be-column)
       (error "Invalid column component: %s" (car elem))))
   (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
                       (propertize " " 'read-only t)))
@@ -1227,5 +1228,3 @@ all overlays."
       lens-default-style lens-box-style)
 
 ;; (setq lens-default-style nil)
-
-
