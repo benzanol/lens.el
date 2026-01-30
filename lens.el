@@ -797,6 +797,9 @@ Returns (ELEM STRING KEY)"
                            (error "Not a component: %s" (car elem))))
          (key (cadr elem))
          (str (apply component-fn cb (cddr elem))))
+    ;; An empty string WILL break diffing and detection of the current element
+    (when (string-empty-p str) (setq str "-"))
+
     (unless (keywordp key) (error "Element key must be a keyword: %s" elem))
     (list elem str key)))
 
@@ -808,7 +811,9 @@ Returns (ELEM STRING KEY)"
       (goto-char (1+ he))
       (pcase-dolist (`(,action ,old ,new) diff)
         (if (eq action :insert)
-            (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
+            (insert (car new) (propertize "\n" 'read-only t
+                                          'lens-element-key (cadr new)
+                                          'rear-nonsticky t))
           (let ((start (point))
                 ;; The match is the newline at the end of the old element
                 (match (text-property-search-forward 'lens-element-key))
@@ -856,7 +861,7 @@ UI is a plist with properties :tostate, :totext, and :toui."
           :insert
           (lambda (state)
             (string-join
-             (cons (propertize "\n" 'lens-element-key 'START)
+             (cons (propertize "\n" 'lens-element-key 'START 'rear-nonsticky t)
                    (--map (concat (cadr it)
                                   (propertize "\n" 'lens-element-key (caddr it)))
                           (plist-get state :ui))))))))
@@ -1224,40 +1229,3 @@ all overlays."
 ;; (setq lens-default-style nil)
 
 
-;;; UIs
-
-(lens-defui raw
-  :tostate
-  (lambda (text)
-    (list :text text))
-  :totext
-  (lambda (st)
-    (plist-get st :text))
-  :toui
-  (lambda (st)
-    `((box ,(plist-get st :text)
-           ,(@2 (plist-put @1 :text @2))))))
-
-(lens-defui test
-  :tostate
-  (lambda (text)
-    (if (string-match-p "\\`-+$" text)
-        (list :count (length (car (split-string text "\n")))
-              :rest (s-join "\n" (cdr (split-string text "\n"))))
-      (list :count 0 :rest text)))
-  :totext
-  (lambda (st)
-    (concat (make-string (max 0 (plist-get st :count)) ?-) "\n" (plist-get st :rest)))
-  :toui
-  (lambda (st)
-    ;; (message ">>%s" st)
-    `((row
-       (button "/2" ,(@1 (=> (plist-get @1 :count) / 2)))
-       (button "-" ,(@1 (=> (plist-get @1 :count) - 1)))
-       ,(format "#%s" (plist-get st :count))
-       (button "+" ,(@1 (=> (plist-get @1 :count) + 1)))
-       (button "x2" ,(@1 (=> (plist-get @1 :count) * 2))))
-      (box ,(plist-get st :rest)
-           ,(@2 (plist-put @1 :rest @2))))))
-
-;; (lens-insert (lens-buffer-source (get-buffer "temp2.org")) (lens-raw-display))
