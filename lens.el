@@ -352,24 +352,24 @@ reinsert the lens content."
     ;; Replacing the lens when it hasn't changed can lead to issues
     ;; with the undo history
     (unless (and (string= oldtext newtext) (equal oldstate newstate))
-      (lens-save-position-in-ui
-       (lens-silent-edit
-        ;; Refresh the style properties
-        (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
-        (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
+      (lens-silent-edit
+       ;; Refresh the style properties
+       (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
+       (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
 
-        (if norefresh
-            ;; Reinsert only the header and footer
-            (let ((strs (lens--generate-headers newlens)))
-              (goto-char fb) (delete-region fb fe) (insert (cdr strs))
-              (lens--refresh-buffer fb (point))
-              (goto-char hb) (delete-region hb he) (insert (car strs))
-              (lens--refresh-buffer hb (point))
-              (when (functionp norefresh)
-                (funcall norefresh oldstate newstate he fb)))
+       (if norefresh
+           ;; Reinsert only the header and footer
+           (let ((strs (lens--generate-headers newlens)))
+             (save-excursion (goto-char fb) (delete-region fb fe) (insert (cdr strs))
+                             (lens--refresh-buffer fb (point)))
+             (save-excursion (goto-char hb) (delete-region hb he) (insert (car strs))
+                             (lens--refresh-buffer hb (point)))
+             (when (functionp norefresh)
+               (funcall norefresh oldstate newstate he fb)))
 
-          ;; Reinsert the entire lens
-          (let ((insert (lens--generate-insert-text newlens)))
+         ;; Reinsert the entire lens
+         (let ((insert (lens--generate-insert-text newlens)))
+           (lens-save-position
             (delete-region hb fe)
             (insert insert)
             ;; Go back to the start of the lens so that
@@ -819,19 +819,29 @@ Returns (ELEM STRING KEY)"
 (defun lens--ui-renderer (old-state new-state he fb)
   (let* ((old-ui (plist-get old-state :ui))
          (new-ui (plist-get new-state :ui))
-         (diff (lens--ui-diff old-ui new-ui)))
+         (diff (lens--ui-diff old-ui new-ui))
+         new-fb match cursor)
+    (lens-save-position-in-ui
+     (goto-char (1+ he))
+     ;; Apply each diff element
+     (pcase-dolist (`(,action ,old ,new) diff)
+       (if (eq action :insert)
+           (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
+         (let ((start (point))
+               ;; The match is the newline at the end of the old element
+               (match (text-property-search-forward 'lens-element-key))
+               m)
+           (cl-assert match)
+           (cl-assert (eq (prop-match-value match) (cadr old)))
+           (when (eq action :delete) (delete-region start (point))))))
+     (setq new-fb (point)))
+    ;; Check if there is a cursor prop to jump to
     (save-excursion
       (goto-char (1+ he))
-      (pcase-dolist (`(,action ,old ,new) diff)
-        (if (eq action :insert)
-            (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
-          (let ((start (point))
-                ;; The match is the newline at the end of the old element
-                (match (text-property-search-forward 'lens-element-key))
-                m)
-            (cl-assert match)
-            (cl-assert (eq (prop-match-value match) (cadr old)))
-            (when (eq action :delete) (delete-region start (point)))))))))
+      (setq match (text-property-search-forward 'lens-ui-cursor t #'eq))
+      (when (and match (<= (prop-match-beginning match) new-fb))
+        (setq cursor (prop-match-beginning match))))
+    (when cursor (goto-char cursor))))
 
 (defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args norefresh)
   (let* ((region (lens-at-point))
