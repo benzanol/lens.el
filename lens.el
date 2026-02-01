@@ -957,6 +957,16 @@ Create a ui context with the following properties:
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
 
+(defvar lens--nested-callback-state nil
+  "A copy of the root-level state of the ui, which should be mutated.")
+
+(defun lens--follow-key-path (state path)
+  (if (null path) state
+    (lens--follow-key-path
+     (or (alist-get (car path) (plist-get state :content))
+         (error "Invalid component key path"))
+     (cdr path))))
+
 (defun lens--ui-callback (ctx run)
   (lens-let-body
    (let root-ctx (or (plist-get ctx :root-ctx) ctx))
@@ -970,6 +980,8 @@ Create a ui context with the following properties:
 
    (let old-state (caddr (car region)))
    (let lens--callback-state (copy-tree old-state))
+   (let lens--nested-callback-state (lens--follow-key-path lens--callback-state
+                                                           (plist-get ctx :path)))
 
    ;; Apply the mutations
    (funcall run)
@@ -983,13 +995,6 @@ Create a ui context with the following properties:
 
 
 ;;;; Use state
-
-(defun lens--follow-key-path (state path)
-  (if (null path) state
-    (lens--follow-key-path
-     (or (alist-get (car path) (plist-get state :content))
-         (error "Invalid component key path"))
-     (cdr path))))
 
 (defun lens--use-state-callback (path hook-idx value)
   (let* ((root-state (or lens--callback-state
@@ -1121,7 +1126,8 @@ with the following properties:
       lambda (body state-var set-var initial)
       `((let* ((=use-state= (lens--use-state (or lens--current-ctx (error "No containing lens context"))
                                              ,initial))
-               (,state-var (car =use-state=)))
+               (,state-var (car =use-state=))
+               (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var (cdr =use-state=)))
             ,@body))))
      (:use-effect
@@ -1139,8 +1145,49 @@ with the following properties:
 (lens-defui test (ctx)
   (:use-state count set-count 1)
   (:use-effect (lambda () (message "Effect!")) count)
-  (list `(counter :c1 "hi")
+
+  (:use-state text set-text "hi")
+
+  (list `(wrapped-box :box ,text ,set-text)
+        `(counter :c1 "hi")
         `(counter :c2 "yo")))
+
+(lens-defcomponent wrapped-box (ctx text set-text)
+  (:use-state cursor set-cursor nil)
+  (:use-effect (lambda ()
+                 (when cursor
+                   (let ((region (lens-at-point)))
+                     (goto-char (caddr region))
+                     (text-property-search-forward 'lens-ui-cursor)
+                     (forward-char -1)
+                     (message "The cursor should go at %s but is at %s" cursor (caddr region)))))
+               cursor)
+
+  (let map (make-sparse-keymap))
+  (unless cursor
+    (define-key map (kbd "<return>")
+                (lambda () (interactive)
+                  (lens--ui-callback ctx (lambda () (set-cursor (length text)))))))
+  (when cursor
+    (define-key map (kbd "<tab>")
+                (lambda () (interactive)
+                  (lens--ui-callback ctx (lambda () (set-cursor nil))))))
+
+
+  (lens--field (propertize (lens--textbox-wrap text :width 30 :cursor cursor
+                                               :box-props '(lens-textbox-border t read-only t)
+                                               :title (if cursor "Tab to unfocus" "Enter to focus")
+                                               :charset 'unicode)
+                           'read-only (unless cursor t) 'face (unless cursor 'shadow))
+               (lambda (newtext newcursor)
+                 (let ((unwrapped (lens--textbox-unwrap newtext newcursor 'lens-textbox-border t)))
+                   (lens--ui-callback
+                    ctx
+                    (lambda ()
+                      (funcall set-text (car unwrapped))
+                      (set-cursor (cdr unwrapped))))))
+               "--------------------\n" "\n--------------------"
+               `(keymap ,map)))
 
 (lens-defcomponent counter (ctx label)
   (:use-state count set-count 1)
