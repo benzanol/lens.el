@@ -858,16 +858,16 @@ will be nil."
 
 ;;;; Rerenderer
 
-(defun lens--ui-get-all-hooks (component)
+(defun lens--ui-get-use-state-hooks (component)
   (let ((children (plist-get component :content)))
     (cons
-     (cons nil (plist-get component :hooks))
-     (--map (cons (car it) (lens--ui-get-all-hooks (cdr it)))
+     (cons nil (--filter (eq (car it) :use-state) (plist-get component :hooks)))
+     (--map (cons (car it) (lens--ui-get-use-state-hooks (cdr it)))
             (when (listp children) children)))))
 
 (defun lens--ui-renderer (old-state new-state he _fb)
   (let* ((old-ui (--map (list (cons (plist-get (cdr it) :element)
-                                    (lens--ui-get-all-hooks (cdr it)))
+                                    (lens--ui-get-use-state-hooks (cdr it)))
                               (lens--ui-state-to-string (cdr it) t)
                               (car it))
                         (plist-get old-state :content)))
