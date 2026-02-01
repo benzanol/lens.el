@@ -32,20 +32,61 @@ redisplay will be cancelled.")
 
 
 ;;; Utilities
-;;;; Utils
+;;;; Let macro
 
 (defmacro lens-let-body (&rest body)
-  (pcase (car body)
-    ('nil nil)
-    (`(,(and fn (or 'let 'cl-flet)) ,(and var (pred symbolp)) ,value)
-     `(,fn ((,var ,value))
-           (lens-let-body ,@(cdr body))))
-    (`(let ,(and vars (pred vectorp)))
-     `(let ,(append vars nil)
-        (lens-let-body ,@(cdr body))))
-    (_
-     (if (null (cdr body)) (car body)
-       (list #'progn (car body) (cons #'lens-let-body (cdr body)))))))
+  "A macro designed to make ui component bodies simpler.
+
+If any of body is (LET-SYMBOL VAR VAL), then this will be compiled to a
+let expression containing the rest of the body. LET-SYMBOL can be any of
+`let', `cl-flet', `when-let', `pcase-let', or `-let'.
+
+So,
+  (let a 4)
+  (when-let b (1+ a))
+  (+ a b)
+will be converted to
+  (let ((a 4))
+    (when-let ((b (1+ a)))
+      (+ a b)))
+
+Furthermore, the car of body can be a vector containing custom symbols
+to convert to special forms. Each entry should be a cons cell mapping
+the desired symbol to a function. When the symbol is used as a function
+call in the top level of BODY, this function will be called at compile
+time to generate the new expression.
+
+The first argument is a list of Lisp expressions, which is the result of
+applying `lens-let-body' to the remaining body. The remaining arguments
+are the list of arguments passed to the call. The return value is a list
+of Lisp expressions to replace the original body.
+
+For example, the following is expression used for use state:
+  [(:use-state
+    (lambda (body state-var set-var)
+      `((let* ((=use-state= (lens--use-state))
+               (,state-var (car =use-state=)))
+          (cl-flet ((,set-var (cdr =use-state=)))
+            ,@body)))))]
+
+This allows for the following syntax:
+  (:use-state count set-count)
+  (set-count (1+ count))"
+
+  (let ((custom (when (vectorp (car body)) (append (pop body) nil)))
+        exprs func)
+    ;; Go through the expressions in reverse
+    (dolist (line (reverse body))
+      (cond ((memq (car line) '(let cl-flet when-let pcase-let -let))
+             (setq exprs `((,(car line) ((,(cadr line) ,(caddr line)))
+                            ,@exprs))))
+            ((setq func (alist-get (car line) custom))
+             (setq exprs (apply func exprs (cdr line))))
+            ((push line exprs))))
+    (if (> (length exprs) 1) (cons #'progn exprs) (car exprs))))
+
+
+;;;; Utils
 
 (defmacro lens-save-position (&rest body)
   "Save the line and column of the cursor when executing BODY."
@@ -59,14 +100,16 @@ redisplay will be cancelled.")
 (defmacro lens-save-position-in-ui (&rest body)
   "Save the current position relative to the containing ui element."
   `(let* ((line (line-number-at-pos)) (col (current-column))
-          mb me id ui-key ui-line region)
+          me ui-key ui-line region)
      (save-excursion
        (and
+        ;; Find the prop match at the end of the component
         (setq me (text-property-search-forward 'lens-element-key))
         ;; If the next prop match is a start, then we weren't inside of an element
         (not (eq (prop-match-value me) 'START))
-        (setq mb (progn (forward-char -1)
-                        (text-property-search-backward 'lens-element-key)))
+        ;; Go to the prop match at the beginning of the component
+        (progn (forward-char -1)
+               (text-property-search-backward 'lens-element-key))
         ;; We are inside of a component, so set the relevant values
         (setq ui-line (- line (line-number-at-pos))
               ui-key (prop-match-value me))))
@@ -734,11 +777,11 @@ and returns the new value of the text data."
 (defun lens--ui-diff (old-list new-list)
   "Diff OLD-LIST and NEW-LIST of UI elements using Myers algorithm.
 
-Each element is (ELEM . VALUE) where ELEM is what is being
-compared (using #'equal), and VALUE is what is returned.
+Comparison is done using the car of each element, so elements can have
+different cdr but still be considered the same.
 
 Returns a list of (:keep/:insert/:delete OLD NEW), where OLD is the old
-VALUE and NEW is the new VALUE. For :insert and :delete, one of these
+value and NEW is the new value. For :insert and :delete, one of these
 will be nil."
   (let* ((n (length old-list))
          (m (length new-list))
@@ -752,8 +795,8 @@ will be nil."
 
     (cond
      ((and (= n 0) (= m 0)) '())
-     ((= n 0) (mapcar (lambda (e) (list :insert nil (cdr e))) new-list))
-     ((= m 0) (mapcar (lambda (e) (cons :delete (cdr e) nil)) old-list))
+     ((= n 0) (mapcar (lambda (e) (list :insert nil e)) new-list))
+     ((= m 0) (mapcar (lambda (e) (list :delete e nil)) old-list))
      (t
       ;; Forward pass
       (catch 'found
@@ -798,58 +841,45 @@ will be nil."
               ;; Record diagonal matches (in reverse)
               (while (and (> x prev-x) (> y prev-y))
                 (setq x (1- x) y (1- y))
-                (push (list :keep (cdr (aref old-vec x)) (cdr (aref new-vec y))) edits))
+                (push (list :keep (aref old-vec x) (aref new-vec y)) edits))
               ;; Record the edit
               (if go-down
                   (progn (setq y (1- y))
-                         (push (list :insert nil (cdr (aref new-vec y))) edits))
+                         (push (list :insert nil (aref new-vec y)) edits))
                 (setq x (1- x))
-                (push (list :delete (cdr (aref old-vec x)) nil) edits)))
+                (push (list :delete (aref old-vec x) nil) edits)))
             (setq d (1- d))))
         ;; Handle initial diagonal (d=0 matches)
         (while (and (> x 0) (> y 0))
           (setq x (1- x) y (1- y))
-          (push (list :keep (cdr (aref old-vec x)) (cdr (aref new-vec y))) edits))
+          (push (list :keep (aref old-vec x) (aref new-vec y)) edits))
         edits)))))
 
 
-;;;; Generating Uis
+;;;; Rerenderer
 
-(defun lens--generate-ui-element (elem cb)
-  "Generates a single ui element by applying the component to the args.
-
-ELEM is (COMPONENT KEY ARGS...). CB is the update callback.
-
-Returns (ELEM STRING KEY)"
-
-  ;; Use a string as a shorthand for the 'string component
-  (let* ((component-fn (or (get (car elem) 'lens-component)
-                           (error "Not a component: %s" (car elem))))
-         (key (cadr elem))
-         (str (apply component-fn cb (cddr elem))))
-    ;; An empty string WILL break diffing and detection of the current element
-    (when (string-empty-p str) (setq str "-"))
-
-    (unless (keywordp key) (error "Element key must be a keyword: %s" elem))
-    (list elem str key)))
-
-(defun lens--ui-renderer (old-state new-state he fb)
-  (let* ((old-ui (plist-get old-state :ui))
-         (new-ui (plist-get new-state :ui))
+(defun lens--ui-renderer (old-state new-state he _fb)
+  (let* ((old-ui (--map (list (plist-get (cdr it) :element)
+                              (lens--ui-state-to-string (cdr it) t)
+                              (car it))
+                        (plist-get old-state :content)))
+         (new-ui (--map (list (plist-get (cdr it) :element)
+                              (lens--ui-state-to-string (cdr it) t)
+                              (car it))
+                        (plist-get new-state :content)))
          (diff (lens--ui-diff old-ui new-ui))
          new-fb match cursor)
     (lens-save-position-in-ui
      (goto-char (1+ he))
      ;; Apply each diff element
-     (pcase-dolist (`(,action ,old ,new) diff)
+     (pcase-dolist (`(,action (_ ,_new_str ,old-key) (_ ,new-str ,new-key)) diff)
        (if (eq action :insert)
-           (insert (car new) (propertize "\n" 'read-only t 'lens-element-key (cadr new)))
+           (insert new-str (propertize "\n" 'read-only t 'lens-element-key new-key))
          (let ((start (point))
                ;; The match is the newline at the end of the old element
-               (match (text-property-search-forward 'lens-element-key))
-               m)
+               (match (text-property-search-forward 'lens-element-key)))
            (cl-assert match)
-           (cl-assert (eq (prop-match-value match) (cadr old)))
+           (cl-assert (eq (prop-match-value match) old-key))
            (when (eq action :delete) (delete-region start (point))))))
      (setq new-fb (point)))
     ;; Check if there is a cursor prop to jump to
@@ -860,51 +890,166 @@ Returns (ELEM STRING KEY)"
         (setq cursor (prop-match-beginning match))))
     (when cursor (goto-char cursor))))
 
-(defun lens--ui-callback-for-lens (ui-id toui mutator mutator-args norefresh)
-  (let* ((region (lens-at-point))
-         (state (caddr (car region)))
-         (new-state (apply #'list state))
-         generated)
 
-    (unless (eq (plist-get (caddr (car region)) :ui-id) ui-id) (error "Incorrect lens at point"))
+;;;; Use state
 
-    ;; Copy the internal state
-    (plist-put new-state :state (copy-tree (plist-get new-state :state)))
+(defun lens--use-state-callback (newstate hook-idx value)
+  (let* ((hooks (plist-get newstate :hooks))
+         (hook (nth hook-idx hooks)))
+    (setf (cadr hook) value)))
+
+(defun lens--use-state (ctx initial)
+  (let* ((state (plist-get ctx :state))
+         (hooks (plist-get state :hooks))
+         (hook-idx (plist-get ctx :hook-idx))
+         (cb (plist-get ctx :callback))
+         hook)
+
+    (if (plist-get ctx :is-first-call)
+        ;; Add a hook to the hooks list
+        (progn (cl-assert (eq (length hooks) hook-idx))
+               (setq hook (list :use-state initial))
+               (plist-put state :hooks (nconc hooks (list hook))))
+      ;; Check if the indexed hook is a use-state hook
+      (setq hook (nth hook-idx hooks))
+      (unless hook (error "Called :use-state hook where no hook was previously"))
+      (unless (eq (car hook) :use-state) (error "Called :use-state hook where %s hook was previously" (car hook))))
+
+    (plist-put state :hook-idx (1+ hook-idx))
+    (cons (cadr hook) (lambda (value) (funcall cb (lambda (newst) (lens--use-state-callback newst hook-idx value)))))))
+
+
+;;;; Generating Uis
+
+(defvar lens--current-ctx nil)
+
+(defun lens--generate-ui (elem cb old-state)
+  "Return the new state for the component.
+
+ELEM is either (ELEM KEY ARGS...) or a function.
+
+Create a ui context with the following properties:
+  :is-first-call - Indicates whether calling a UI component for the
+    first time, or a subsequent time.
+  :state - The internal state for the component being called. See
+    `lens-ui-display'."
+  (let* ((state (if old-state (copy-tree old-state) (list :hooks nil :content nil)))
+         (ctx (list :state state
+                    :callback cb
+                    :hook-idx 0
+                    :is-first-call (null old-state)))
+         ;; Perform the actual function
+         (output (let ((lens--current-ctx ctx))
+                   (if (functionp elem)
+                       (funcall elem ctx)
+                     (apply (get (car elem) 'lens-component) ctx (cddr elem)))))
+         (content
+          (if (stringp output) output
+            (--map (cons (if (keywordp (cadr it)) (cadr it)
+                           (error "First argument to component must be a keyword"))
+                         (lens--generate-ui
+                          it
+                          ;; The nest-mutator expects to be passed the
+                          ;; state for the nested component
+                          (lambda (nest-mutator)
+                            (funcall cb
+                                     (lambda (state-copy)
+                                       (let ((nested-state (plist-get (plist-get state-copy :content)
+                                                                      (cadr it))))
+                                         (funcall nest-mutator nested-state)))))
+                          (when old-state
+                            (alist-get (cadr it) (plist-get old-state :content)))))
+                   output))))
+    (plist-put state :content content)
+    (unless (functionp elem)
+      (plist-put state :element elem))
+    state))
+
+
+;;;; Ui display
+
+(defun lens--ui-state-to-string (state &optional nested)
+  (let ((content (plist-get state :content)))
+    (if (and nested (stringp content)) content
+      (string-join
+       (cons (unless nested (propertize "\n" 'lens-element-key 'START))
+             (--map (concat (lens--ui-state-to-string (cdr it) t)
+                            (propertize "\n" 'lens-element-key (unless nested (car it))))
+                    content))))))
+
+(defun lens--ui-callback (mutator id ui-func)
+  (let* ((cb (lambda (mutator) (lens--ui-callback mutator id ui-func)))
+         (region (lens-at-point))
+         (old-state (caddr (car region)))
+         (new-state (copy-tree old-state)))
+
+    (unless (eq (plist-get (caddr (car region)) :id) id) (error "Incorrect ui at point"))
+
+    (funcall mutator new-state)
+    (setq new-state (lens--generate-ui ui-func cb new-state))
+
     ;; Apply the mutator
-    (apply mutator (plist-get new-state :state) mutator-args)
-    ;; Generate the new ui
-    (let* ((cb (lambda (mut &optional mut-args norefresh)
-                 (lens--ui-callback-for-lens ui-id toui mut mut-args norefresh)))
-           (ui (funcall toui (plist-get new-state :state)))
-           (generated (--map (lens--generate-ui-element it cb) ui)))
-      (plist-put new-state :ui generated)
+    (lens-modify region new-state nil #'lens--ui-renderer)))
 
-      ;; Apply modifications
-      (lens-modify region new-state nil (or norefresh #'lens--ui-renderer)))))
-
-(defun lens-ui-display (ui)
+(defun lens-ui-display (ui-func)
   "Display spec for custom ui definitions.
 
-UI is a plist with properties :tostate, :totext, and :toui."
-  (-let (((&plist :tostate tostate :totext totext :toui toui) ui)
-         (ui-id (abs (random))))
+UI is a function which takes a ui context and returns a list of
+components.
 
+The state for a particular component in the component tree is a plist
+with the following properties:
+  :hooks - A list of hooks called in the component, in order. Each call
+    must have the same hooks and order. Each hook has the
+    format (HOOK-KEYWORD ARGS...).
+  :content - An alist from keys to child elements, or a string
+
+The state for the display is the state for the root component, along
+with the following properties:
+  :text - The underlying text representation of the current state. The
+    text can be changed by using the :use-text hook.
+  :ui - A list of tuples (ELEM STRING KEY), which is the list of
+    elements returned by the root element."
+
+  (let ((id (abs (random))))
     (list :tostate
           (lambda (text)
-            (let* ((state (funcall tostate text))
-                   (ui (funcall toui state))
-                   (cb (lambda (mut &optional mut-args norefresh)
-                         (lens--ui-callback-for-lens ui-id toui mut mut-args norefresh)))
-                   (generated (--map (lens--generate-ui-element it cb) ui)))
-              (list :state state :ui-id ui-id :ui generated)))
-          :totext (lambda (state) (funcall totext (plist-get state :state)))
+            (let* ((cb (lambda (mutator)
+                         (lens--ui-callback mutator id ui-func)))
+                   (state (lens--generate-ui ui-func cb nil)))
+              (plist-put state :text text)
+              (plist-put state :id id)
+              state))
+          :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
-            (string-join
-             (cons (propertize "\n" 'lens-element-key 'START)
-                   (--map (concat (cadr it)
-                                  (propertize "\n" 'lens-element-key (caddr it)))
-                          (plist-get state :ui))))))))
+            (lens--ui-state-to-string state)))))
+
+
+;;;; Defui
+
+(defvar lens-ui-alist nil)
+
+(defmacro lens-ui-body (&rest body)
+  `(lens-let-body
+    [(:use-state
+      lambda (body state-var set-var initial)
+      `((let* ((=use-state= (lens--use-state (or lens--current-ctx (error "No containing lens context"))
+                                             ,initial))
+               (,state-var (car =use-state=)))
+          (cl-flet ((,set-var (cdr =use-state=)))
+            ,@body))))]
+    ,@body))
+
+(defmacro lens-defui (name arglist &rest body)
+  (declare (indent 2))
+  `(setf (alist-get ',name lens-ui-alist)
+         (lambda ,arglist (lens-ui-body ,@body))))
+
+(lens-defui test (ctx)
+  (:use-state count set-count 1)
+  (list `(string :count ,(format ">%s<" count))
+        `(button :increment "+" ,(lambda () (set-count (1+ count))))))
 
 
 ;;;; Components
@@ -926,13 +1071,13 @@ UI is a plist with properties :tostate, :totext, and :toui."
                         ,(cdr it))
                   props))))
 
-(lens-defcomponent box (cb text onchange &rest plist)
+(lens-defcomponent box (_ctx text onchange &rest plist)
   (lens--field text
                (lambda (new _cursor)
-                 (funcall cb (or onchange #'ignore) (list new) t))
+                 (funcall onchange new))
                "[begin box]\n" "\n[end box]"))
 
-(lens-defcomponent string (cb str)
+(lens-defcomponent string (_ctx str)
   :can-be-column t
   (propertize (if (stringp str) str (string-join str "\n"))
               'read-only t))
@@ -952,11 +1097,10 @@ UI is a plist with properties :tostate, :totext, and :toui."
     (if click (funcall click)
       (error "Nothing to click"))))
 
-(lens-defcomponent button (cb label onclick &rest plist)
+(lens-defcomponent button (ctx label onclick &rest plist)
   :can-be-column t
-  (propertize (format " %s " label) 'lens-click
-              (lambda ()
-                (funcall cb (or onclick #'ignore)))
+  (propertize (format " %s " label)
+              'lens-click (or onclick #'ignore)
               'local-map (list 'keymap lens-button-keymap (current-local-map))
               'font-lock-face (or (plist-get plist :face) 'lens-button)
               'read-only t))
@@ -1171,14 +1315,6 @@ string to insert between the columns."
 
 ;;; Usable functions
 ;;;; Ui Functions
-
-(defvar lens-ui-alist nil)
-
-(defmacro lens-defui (name &rest body)
-  (declare (indent 1) (doc-string 2))
-  (let ((docstring (when (stringp (car body)) (pop body))))
-    (list #'setf (list #'alist-get (list 'quote name) 'lens-ui-alist)
-          (cons #'list (append (list :docstring docstring) body)))))
 
 (defun lens-read-ui (&optional prompt)
   (let ((name (completing-read (or prompt "Ui: ") (mapcar #'car lens-ui-alist))))
