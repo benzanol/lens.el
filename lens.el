@@ -660,7 +660,7 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
 ;;;; Fields
 
 (bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
-(defun lens--field (text onchange &optional head foot props)
+(defun lens--field (text onchange &optional head foot props head-face)
   "Create a controlled, modifyable region of text.
 
 TEXT is the initial content of the region. ONCHANGE is a function
@@ -678,16 +678,13 @@ and then the ONCHANGE function will be called.
 
 PROPS is a plist of text properties that will be applied to the text of
 the field."
-  (setq head (or head "---\n") foot (or foot "\n---"))
+  (setq head (or head (propertize "---\n" 'face 'lens-field-header 'font-lock-face 'lens-field-header))
+        foot (or foot (propertize "\n---" 'face 'lens-field-header 'font-lock-face 'lens-field-header)))
   (let* ((field (lens--make-symbol "field"))
          (hooks '(lens--field-modification-hook)))
     (fset field onchange)
     (put field 'lens-field-props props)
     (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
-
-    (dolist (prop '(face font-lock-face))
-      (setq head (propertize head prop 'lens-field-header)
-            foot (propertize foot prop 'lens-field-header)))
 
     (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
             (apply #'propertize text
@@ -780,9 +777,7 @@ and returns the new value of the text data."
 Comparison is done using the car of each element, so elements can have
 different cdr but still be considered the same.
 
-Returns a list of (:keep/:insert/:delete OLD NEW), where OLD is the old
-value and NEW is the new value. For :insert and :delete, one of these
-will be nil."
+Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
   (let* ((n (length old-list))
          (m (length new-list))
          (max-d (+ n m))
@@ -795,8 +790,8 @@ will be nil."
 
     (cond
      ((and (= n 0) (= m 0)) '())
-     ((= n 0) (mapcar (lambda (e) (list :insert nil e)) new-list))
-     ((= m 0) (mapcar (lambda (e) (list :delete e nil)) old-list))
+     ((= n 0) (mapcar (lambda (e) (list :insert (car e) nil e)) new-list))
+     ((= m 0) (mapcar (lambda (e) (list :delete (car e) e nil)) old-list))
      (t
       ;; Forward pass
       (catch 'found
@@ -841,58 +836,88 @@ will be nil."
               ;; Record diagonal matches (in reverse)
               (while (and (> x prev-x) (> y prev-y))
                 (setq x (1- x) y (1- y))
-                (push (list :keep (aref old-vec x) (aref new-vec y)) edits))
+                (push (let ((old (aref old-vec x))
+                            (new (aref new-vec y)))
+                        (list :keep (car old) (cdr old) (cdr new)))
+                      edits))
               ;; Record the edit
               (if go-down
                   (progn (setq y (1- y))
-                         (push (list :insert nil (aref new-vec y)) edits))
+                         (let ((val (aref new-vec y)))
+                           (push (list :insert (car val) nil (cdr val)) edits)))
                 (setq x (1- x))
-                (push (list :delete (aref old-vec x) nil) edits)))
+                (push (let ((val (aref old-vec x)))
+                        (list :delete (car val) (cdr val) nil))
+                      edits)))
             (setq d (1- d))))
         ;; Handle initial diagonal (d=0 matches)
         (while (and (> x 0) (> y 0))
           (setq x (1- x) y (1- y))
-          (push (list :keep (aref old-vec x) (aref new-vec y)) edits))
+          (push (let ((old (aref old-vec x))
+                      (new (aref new-vec y)))
+                  (list :keep (car old) (cdr old) (cdr new)))
+                edits))
         edits)))))
 
 
 ;;;; Rerenderer
 
-(defun lens--ui-get-use-state-hooks (component)
-  (let ((children (plist-get component :content)))
-    (cons
-     (cons nil (--filter (eq (car it) :use-state) (plist-get component :hooks)))
-     (--map (cons (car it) (lens--ui-get-use-state-hooks (cdr it)))
-            (when (listp children) children)))))
+(defun lens--ui-string-rows (state key-path)
+  (let* ((content (plist-get state :content))
+         (element (plist-get state :element)))
+    (if (stringp content)
+        (list (cons (list key-path element
+                          (--filter (eq (car it) :use-state) (plist-get state :hooks)))
+                    content))
+      (--mapcat (lens--ui-string-rows (cdr it) (append key-path (list (car it))))
+                content))))
 
-(defun lens--ui-renderer (old-state new-state he _fb)
-  (let* ((old-ui (--map (list (cons (plist-get (cdr it) :element)
-                                    (lens--ui-get-use-state-hooks (cdr it)))
-                              (lens--ui-state-to-string (cdr it) t)
-                              (car it))
-                        (plist-get old-state :content)))
-         (new-ui (--map (list (cons (plist-get (cdr it) :element)
-                                    (lens--ui-get-all-hooks (cdr it)))
-                              (lens--ui-state-to-string (cdr it) t)
-                              (car it))
-                        (plist-get new-state :content)))
-         (diff (lens--ui-diff old-ui new-ui))
-         new-fb match cursor)
+(defun lens--ui-renderer (old-state new-state he fb)
+  (let* ((old-rows (lens--ui-string-rows old-state nil))
+         (new-rows (lens--ui-string-rows new-state nil))
+         (diff (lens--ui-diff old-rows new-rows))
+         ;; Keep a hash map from key paths to (start . end) positions
+         (key-path-to-posns (make-hash-table :test #'equal :size (* 2 (length new-rows))))
+         (last-key-path nil))
+
+    ;; Add the root position
+    (puthash nil (cons (1+ he) fb) key-path-to-posns)
+
     (lens-save-position-in-ui
      (goto-char (1+ he))
      ;; Apply each diff element
-     (pcase-dolist (`(,action (_ ,_new_str ,old-key) (_ ,new-str ,new-key)) diff)
-       (if (eq action :insert)
-           (insert new-str (propertize "\n" 'read-only t 'lens-element-key new-key))
-         (let ((start (point))
-               ;; The match is the newline at the end of the old element
-               (match (text-property-search-forward 'lens-element-key)))
-           (cl-assert match)
-           (cl-assert (eq (prop-match-value match) old-key))
-           (when (eq action :delete) (delete-region start (point))))))
-     (setq new-fb (point)))
+     (pcase-dolist (`(,action (,key-path) ,_old_str ,new-str) (append diff (list nil)))
+       (let ((start (point)) match)
+         ;; The last pass through is just to record the end positions of the last element
+         (when action
+           (if (eq action :insert)
+               (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
+             ;; The match is the newline at the end of the old element
+             (setq match (text-property-search-forward 'lens-element-key))
+             (cl-assert match)
+             (cl-assert (equal (prop-match-value match) key-path))
+             (when (eq action :delete) (delete-region start (point)))))
+
+         ;; Record the positions of the element
+         (unless (eq action :delete)
+           ;; We need to record the start position for all parent key
+           ;; paths that are new since the last-key-path
+           (dolist (i (number-sequence 1 (length key-path)))
+             (let ((sub-path (-slice key-path 0 i)))
+               (unless (equal sub-path (-slice last-key-path 0 i))
+                 (puthash sub-path (cons start nil) key-path-to-posns))))
+           ;; We need to record the end position for all key paths
+           ;; that are parents of last-key-path, but not key-path
+           (dolist (i (number-sequence 1 (length last-key-path)))
+             (let ((sub-path (-slice last-key-path 0 i)))
+               (unless (equal sub-path (-slice key-path 0 i))
+                 (setcdr (gethash sub-path key-path-to-posns) start))))
+
+           ;; Update last-key-path
+           (setq last-key-path key-path)))))
+
     ;; Run any use effect callbacks
-    (lens--ui-run-effects new-state)))
+    (lens--ui-run-effects new-state key-path-to-posns)))
 
 
 ;;;; Generating uis
@@ -1028,17 +1053,20 @@ Create a ui context with the following properties:
 
 ;;;; Use effect
 
-(defun lens--ui-run-effects (state)
-  (dolist (hook (plist-get state :hooks))
-    (when (and (eq (car hook) :use-effect)
-               (nth 3 hook))
-      (funcall (cadr hook))))
-  (let ((children (plist-get state :content)))
-    (when (listp children)
-      (dolist (child children)
-        (lens--ui-run-effects (cdr child))))))
+(defun lens--ui-run-effects (state path-to-posn &optional key-path)
+  (let ((posn (or (gethash key-path path-to-posn)
+                  (error "No position found for key path %s" key-path))))
+    (dolist (hook (plist-get state :hooks))
+      (when (and (eq (car hook) :use-effect)
+                 (nth 3 hook))
+        (funcall (cadr hook) (car posn) (cdr posn))))
+    (let ((children (plist-get state :content)))
+      (when (listp children)
+        (dolist (child children)
+          (lens--ui-run-effects (cdr child) path-to-posn
+                                (append key-path (list (car child)))))))))
 
-(defun lens--use-effect (ctx effect dependencies)
+(defun lens--use-effect (ctx dependencies effect)
   "Define a use-effect hook.
 
 The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
@@ -1074,15 +1102,6 @@ dependencies changed since the last render."
 
 ;;;; Ui display
 
-(defun lens--ui-state-to-string (state &optional nested)
-  (let ((content (plist-get state :content)))
-    (if (and nested (stringp content)) content
-      (string-join
-       (cons (unless nested (propertize "\n" 'lens-element-key 'START))
-             (--map (concat (lens--ui-state-to-string (cdr it) t)
-                            (propertize "\n" 'lens-element-key (unless nested (car it))))
-                    content))))))
-
 (defun lens-ui-display (ui-func)
   "Display spec for custom ui definitions.
 
@@ -1113,7 +1132,10 @@ with the following properties:
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
-            (lens--ui-state-to-string state)))))
+            (cl-loop for ((key) . string) in (lens--ui-string-rows state nil)
+                     for newline = (propertize "\n" 'read-only t 'lens-element-key key)
+                     concat (concat string newline) into str
+                     finally return (concat (propertize "\n" 'lens-element-key 'START) str))))))
 
 
 ;;;; Defui
@@ -1131,9 +1153,9 @@ with the following properties:
           (cl-flet ((,set-var (cdr =use-state=)))
             ,@body))))
      (:use-effect
-      lambda (body effect dependencies)
+      lambda (body dependencies effect)
       `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
-                          ,effect ,dependencies)
+                          ,dependencies ,effect)
         ,@body))]
     ,@body))
 
