@@ -34,16 +34,24 @@ redisplay will be cancelled.")
 ;;; Utilities
 ;;;; Let macro
 
+(defvar lens--let-keywords '((:let . let)
+                             (:flet . cl-flet)
+                             (:when-let . when-let)
+                             (:pcase-let . pcase-let)
+                             (:-let . -let))
+  "An alist mapping let keywords to their corresponding functions.")
+
+
 (defmacro lens-let-body (&rest body)
   "A macro designed to make ui component bodies simpler.
 
-If any of body is (LET-SYMBOL VAR VAL), then this will be compiled to a
-let expression containing the rest of the body. LET-SYMBOL can be any of
-`let', `cl-flet', `when-let', `pcase-let', or `-let'.
+If any of body is (LET-KEYWORD VAR VAL), then this will be compiled to a
+let expression containing the rest of the body. LET-KEYWORD can be any
+of `:let', `:flet', `:when-let', `:pcase-let', or `:-let'.
 
 So,
-  (let a 4)
-  (when-let b (1+ a))
+  (:let a 4)
+  (:when-let b (1+ a))
   (+ a b)
 will be converted to
   (let ((a 4))
@@ -77,10 +85,12 @@ This allows for the following syntax:
         exprs func)
     ;; Go through the expressions in reverse
     (dolist (line (reverse body))
-      (cond ((memq (car line) '(let cl-flet when-let pcase-let -let))
-             (setq exprs `((,(car line) ((,(cadr line) ,(caddr line)))
-                            ,@exprs))))
-            ((setq func (alist-get (car line) custom))
+      (cond ((and (listp line)
+                  (setq func (alist-get (car line) lens--let-keywords)))
+             (setq exprs `((,func (,(cdr line))
+                                  ,@exprs))))
+            ((and (listp line)
+                  (setq func (alist-get (car line) custom)))
              (setq exprs (apply func exprs (cdr line))))
             ((push line exprs))))
     (if (> (length exprs) 1) (cons #'progn exprs) (car exprs))))
@@ -994,26 +1004,26 @@ Create a ui context with the following properties:
 
 (defun lens--ui-callback (ctx run)
   (lens-let-body
-   (let root-ctx (or (plist-get ctx :root-ctx) ctx))
+   (:let root-ctx (or (plist-get ctx :root-ctx) ctx))
    (unless (plist-get root-ctx :active) (error "Context is no longer active"))
    ;; (plist-put root-ctx :active nil)
 
-   (let region (lens-at-point))
-   (let ui-id (plist-get root-ctx :ui-id))
+   (:let region (lens-at-point))
+   (:let ui-id (plist-get root-ctx :ui-id))
    (unless (eq ui-id (plist-get (caddr (car region)) :ui-id))
      (error "Incorrect ui at point"))
 
-   (let old-state (caddr (car region)))
-   (let lens--callback-state (copy-tree old-state))
-   (let lens--nested-callback-state (lens--follow-key-path lens--callback-state
-                                                           (plist-get ctx :path)))
+   (:let old-state (caddr (car region)))
+   (:let lens--callback-state (copy-tree old-state))
+   (:let lens--nested-callback-state (lens--follow-key-path lens--callback-state
+                                                            (plist-get ctx :path)))
 
    ;; Apply the mutations
    (funcall run)
 
    ;; Generate the ui for the new state
-   (let ui-func (plist-get root-ctx :ui-func))
-   (let new-state (lens--generate-ui ui-func nil lens--callback-state ui-id))
+   (:let ui-func (plist-get root-ctx :ui-func))
+   (:let new-state (lens--generate-ui ui-func nil lens--callback-state ui-id))
 
    ;; Apply the new state
    (lens-modify region new-state nil #'lens--ui-renderer)))
@@ -1177,55 +1187,6 @@ with the following properties:
         `(counter :c1 "hi")
         `(counter :c2 "yo")))
 
-(lens-defcomponent wrapped-box (ctx text set-text)
-  (:use-state cursor set-cursor nil)
-
-  (let map (make-sparse-keymap))
-  (unless cursor
-    (define-key map (kbd "<return>")
-                (lambda () (interactive)
-                  (lens--ui-callback ctx (lambda () (set-cursor (length text)))))))
-  (when cursor
-    (define-key map (kbd "<tab>")
-                (lambda () (interactive)
-                  (lens--ui-callback ctx (lambda () (set-cursor nil))))))
-
-  (pcase-let `(,lines ,cursor-line, cursor-col)
-    (lens--textbox-wrap
-     text :width 30
-     :cursor cursor
-     :box-props '(lens-textbox-border t read-only t)
-     :title (if cursor "Tab to unfocus" "Enter to focus")
-     :charset 'unicode))
-
-  (dolist (line lines)
-    (put-text-property 0 (length line) 'keymap map line)
-    (unless cursor
-      (put-text-property 0 (length line) 'read-only t line)
-      (put-text-property 0 (length line) 'face 'shadow line)
-      (put-text-property 0 (length line) 'font-lock-face 'shadow line)))
-
-  (message "%s %s -- %s %s" cursor (length text) cursor-line cursor-col)
-
-  (:use-effect
-   (list cursor-line cursor-col)
-   (lambda (start end)
-     (when (and cursor-line cursor-col)
-       (goto-char start)
-       (forward-line cursor-line)
-       (forward-char cursor-col))))
-
-  (lens--field (string-join (butlast (cdr lines)))
-               (lambda (newtext newcursor)
-                 (let ((unwrapped (lens--textbox-unwrap newtext newcursor 'lens-textbox-border t)))
-                   (lens--ui-callback
-                    ctx
-                    (lambda ()
-                      (funcall set-text (car unwrapped))
-                      (set-cursor (cdr unwrapped))))))
-               (car lines)
-               (car (last lines))))
-
 (lens-defcomponent counter (ctx label)
   (:use-state count set-count 1)
   (:use-effect count (lambda () (message "Counter %s changed to %s" label count)))
@@ -1350,57 +1311,56 @@ string to insert between the columns."
 STRING is the text wrapped in a border. LINE and COL specify the
 position in that textbox of the cursor, specified by the :cursor prop."
   (lens-let-body
-   (let width (or (plist-get props :width) 20))
-   (let hpad (or (plist-get props :pad) 1))
-   (let inner-width (- width 2 (* 2 hpad)))
+   (:let width (or (plist-get props :width) 20))
+   (:let hpad (or (plist-get props :pad) 1))
+   (:let inner-width (- width 2 (* 2 hpad)))
    (unless (> inner-width 0) (error "Text box is too thin"))
 
-   (let cursor (plist-get props :cursor))
+   (:let cursor (plist-get props :cursor))
    (when (and cursor (> cursor (length text))) (error "Cursor position exceeds text length"))
 
-   (let chars (alist-get (or (plist-get props :charset) 'ascii)
-                         lens-textbox-chars))
+   (:let chars (alist-get (or (plist-get props :charset) 'ascii)
+                          lens-textbox-chars))
 
-   (let title (plist-get props :title))
+   (:let title (plist-get props :title))
    ;; 3 chars are needed before the title, 3 after the title
-   (let show-title-len (min (- width 6) (length title)))
-   (let show-title (and title (> show-title-len 0)
-                        (substring title 0 show-title-len)))
+   (:let show-title-len (min (- width 6) (length title)))
+   (:let show-title (and title (> show-title-len 0)
+                         (substring title 0 show-title-len)))
 
-   (let hor (alist-get 'horizontal chars))
-   (let head-str
-     (if show-title
-         (concat (alist-get 'top-left chars)
-                 hor " " show-title " " hor
-                 (make-string (- width 6 show-title-len) (aref hor 0))
-                 (alist-get 'top-right chars)
-                 "\n")
-       (concat (alist-get 'top-left chars)
-               (make-string (- width 2) (aref hor 0))
-               (alist-get 'top-right chars)
-               "\n")))
-   (let foot-str (concat (alist-get 'bottom-left chars)
-                         (make-string (- width 2) (aref hor 0))
-                         (alist-get 'bottom-right chars)))
+   (:let hor (alist-get 'horizontal chars))
+   (:let head-str
+         (if show-title
+             (concat (alist-get 'top-left chars)
+                     hor " " show-title " " hor
+                     (make-string (- width 6 show-title-len) (aref hor 0))
+                     (alist-get 'top-right chars)
+                     "\n")
+           (concat (alist-get 'top-left chars)
+                   (make-string (- width 2) (aref hor 0))
+                   (alist-get 'top-right chars)
+                   "\n")))
+   (:let foot-str (concat (alist-get 'bottom-left chars)
+                          (make-string (- width 2) (aref hor 0))
+                          (alist-get 'bottom-right chars)))
 
-   (let body-lines (list ""))
+   (:let body-lines (list ""))
    ;; The current index we are looking at in TEXT
-   (let idx 0)
+   (:let idx 0)
    ;; The start of the current word
-   (let cur-word-start nil)
+   (:let cur-word-start nil)
 
-   (cl-flet add-word
-     (lambda (word &optional is-word)
-       (cond ((> (length word) inner-width)
-              (when (string-empty-p (car body-lines)) (pop body-lines))
-              (while (> (length word) inner-width)
-                (push (substring word 0 inner-width) body-lines)
-                (setq word (substring word inner-width)))
-              (push word body-lines))
-             ((or (> (+ (length word) (length (car body-lines)) (if is-word 1 0))
-                     inner-width))
-              (push word body-lines))
-             (t (setcar body-lines (concat (car body-lines) word))))))
+   (:flet add-word (word &optional is-word)
+          (cond ((> (length word) inner-width)
+                 (when (string-empty-p (car body-lines)) (pop body-lines))
+                 (while (> (length word) inner-width)
+                   (push (substring word 0 inner-width) body-lines)
+                   (setq word (substring word inner-width)))
+                 (push word body-lines))
+                ((or (> (+ (length word) (length (car body-lines)) (if is-word 1 0))
+                        inner-width))
+                 (push word body-lines))
+                (t (setcar body-lines (concat (car body-lines) word)))))
 
    ;; Iterate through the text
    (while (< idx (length text))
@@ -1423,8 +1383,8 @@ position in that textbox of the cursor, specified by the :cursor prop."
    (setq body-lines (nreverse body-lines))
 
    ;; Determine the cursor position
-   (let cursor-line nil)
-   (let cursor-col nil)
+   (:let cursor-line nil)
+   (:let cursor-col nil)
    (when (eq cursor (length text))
      (setq cursor-line (1- (length body-lines))
            cursor-col (length (car (last body-lines)))))
@@ -1438,19 +1398,19 @@ position in that textbox of the cursor, specified by the :cursor prop."
        (setq cursor-col (- cursor line-start))))
 
    ;; Wrap the lines
-   (let vert (alist-get 'vertical chars))
-   (let box-props (plist-get props :box-props))
-   (let wrapped-lines
-     (--map (concat (apply #'propertize (concat vert (make-string hpad ?\s))
-                           'rear-nonsticky t
-                           'front-sticky t
-                           box-props)
-                    it
-                    (apply #'propertize
-                           (concat (make-string (+ (- inner-width (length it)) hpad) ?\s)
-                                   vert "\n")
-                           box-props))
-            body-lines))
+   (:let vert (alist-get 'vertical chars))
+   (:let box-props (plist-get props :box-props))
+   (:let wrapped-lines
+         (--map (concat (apply #'propertize (concat vert (make-string hpad ?\s))
+                               'rear-nonsticky t
+                               'front-sticky t
+                               box-props)
+                        it
+                        (apply #'propertize
+                               (concat (make-string (+ (- inner-width (length it)) hpad) ?\s)
+                                       vert "\n")
+                               box-props))
+                body-lines))
 
    (list (nconc (list (apply #'propertize head-str box-props))
                 wrapped-lines
@@ -1479,6 +1439,56 @@ position in that textbox of the cursor, specified by the :cursor prop."
 
       (cons (buffer-substring-no-properties (point-min) (point-max))
             new-cursor))))
+
+
+;;;; Boxed text box
+
+(lens-defcomponent wrapped-box (ctx text set-text)
+  (:use-state cursor set-cursor nil)
+
+  (:let map (make-sparse-keymap))
+  (unless cursor
+    (define-key map (kbd "<return>")
+                (lambda () (interactive)
+                  (lens--ui-callback ctx (lambda () (set-cursor (length text)))))))
+  (when cursor
+    (define-key map (kbd "<tab>")
+                (lambda () (interactive)
+                  (lens--ui-callback ctx (lambda () (set-cursor nil))))))
+
+  (:pcase-let `(,lines ,cursor-line, cursor-col)
+              (lens--textbox-wrap
+               text :width 30
+               :cursor cursor
+               :box-props '(lens-textbox-border t read-only t)
+               :title (if cursor "Tab to unfocus" "Enter to focus")
+               :charset 'unicode))
+
+  (dolist (line lines)
+    (put-text-property 0 (length line) 'keymap map line)
+    (unless cursor
+      (put-text-property 0 (length line) 'read-only t line)
+      (put-text-property 0 (length line) 'face 'shadow line)
+      (put-text-property 0 (length line) 'font-lock-face 'shadow line)))
+
+  (:use-effect
+   (list cursor-line cursor-col)
+   (lambda (start end)
+     (when (and cursor-line cursor-col)
+       (goto-char start)
+       (forward-line cursor-line)
+       (forward-char cursor-col))))
+
+  (lens--field (string-join (butlast (cdr lines)))
+               (lambda (newtext newcursor)
+                 (let ((unwrapped (lens--textbox-unwrap newtext newcursor 'lens-textbox-border t)))
+                   (lens--ui-callback
+                    ctx
+                    (lambda ()
+                      (funcall set-text (car unwrapped))
+                      (set-cursor (cdr unwrapped))))))
+               (car lines)
+               (car (last lines))))
 
 
 ;;; Usable functions
