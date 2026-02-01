@@ -891,13 +891,8 @@ will be nil."
            (cl-assert (eq (prop-match-value match) old-key))
            (when (eq action :delete) (delete-region start (point))))))
      (setq new-fb (point)))
-    ;; Check if there is a cursor prop to jump to
-    (save-excursion
-      (goto-char (1+ he))
-      (setq match (text-property-search-forward 'lens-ui-cursor t #'eq))
-      (when (and match (<= (prop-match-beginning match) new-fb))
-        (setq cursor (prop-match-beginning match))))
-    (when cursor (goto-char cursor))))
+    ;; Run any use effect callbacks
+    (lens--ui-run-effects new-state)))
 
 
 ;;;; Generating uis
@@ -998,7 +993,7 @@ Create a ui context with the following properties:
 
 (defun lens--use-state-callback (path hook-idx value)
   (let* ((root-state (or lens--callback-state
-                         (error "set-state called outside of lens--ui-callback")))
+                         (error "Called set-state outside of lens--ui-callback")))
          (nested-state (lens--follow-key-path root-state path))
          (hooks (plist-get nested-state :hooks))
          (hook (nth hook-idx hooks)))
@@ -1021,9 +1016,55 @@ Create a ui context with the following properties:
       (unless hook (error "Called :use-state hook where no hook was previously"))
       (unless (eq (car hook) :use-state) (error "Called :use-state hook where %s hook was previously" (car hook))))
 
-    (plist-put state :hook-idx (1+ hook-idx))
+    (plist-put ctx :hook-idx (1+ hook-idx))
     (cons (cadr hook)
           (lambda (value) (lens--use-state-callback path hook-idx value)))))
+
+
+;;;; Use effect
+
+(defun lens--ui-run-effects (state)
+  (dolist (hook (plist-get state :hooks))
+    (when (and (eq (car hook) :use-effect)
+               (nth 3 hook))
+      (funcall (cadr hook))))
+  (let ((children (plist-get state :content)))
+    (when (listp children)
+      (dolist (child children)
+        (lens--ui-run-effects (cdr child))))))
+
+(defun lens--use-effect (ctx effect dependencies)
+  "Define a use-effect hook.
+
+The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
+values of the dependencies. 3. Whether the callback should be called on
+this particular render.
+
+The 3rd parameter is t if this is the first render, or if the
+dependencies changed since the last render."
+  (let* ((state (plist-get ctx :state))
+         (hooks (plist-get state :hooks))
+         (hook-idx (plist-get ctx :hook-idx))
+         hook)
+
+    (if (plist-get ctx :is-first-call)
+        ;; Add a hook to the hooks list
+        (progn (cl-assert (eq (length hooks) hook-idx))
+               (setq hook (list :use-effect effect dependencies t))
+               (plist-put state :hooks (nconc hooks (list hook))))
+      ;; Check if the indexed hook is a use-effect hook
+      (setq hook (nth hook-idx hooks))
+      (unless hook (error "Called use-effect hook where no hook was previously"))
+      (unless (eq (car hook) :use-effect) (error "Called use-effect hook where %s hook was previously" (car hook)))
+      ;; Set the callback to the new callback
+      (setf (cadr hook) effect)
+      ;; Check if the dependencies have changed
+      (if (equal dependencies (caddr hook))
+          (setf (nth 3 hook) nil)
+        (setf (nth 2 hook) dependencies)
+        (setf (nth 3 hook) t)))
+
+    (plist-put ctx :hook-idx (1+ hook-idx))))
 
 
 ;;;; Ui display
@@ -1082,7 +1123,12 @@ with the following properties:
                                              ,initial))
                (,state-var (car =use-state=)))
           (cl-flet ((,set-var (cdr =use-state=)))
-            ,@body))))]
+            ,@body))))
+     (:use-effect
+      lambda (body effect dependencies)
+      `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
+                          ,effect ,dependencies)
+        ,@body))]
     ,@body))
 
 (defmacro lens-defui (name arglist &rest body)
@@ -1092,11 +1138,14 @@ with the following properties:
 
 (lens-defui test (ctx)
   (:use-state count set-count 1)
+  (:use-effect (lambda () (message "Effect!")) count)
   (list `(counter :c1 "hi")
         `(counter :c2 "yo")))
 
 (lens-defcomponent counter (ctx label)
   (:use-state count set-count 1)
+  (:use-effect (lambda () (message "Counter %s changed to %s" label count))
+               count)
   (list `(string :count ,(format "%s: >%s<" label count))
         `(button :increment "+" ,(lambda () (set-count (1+ count))))))
 
