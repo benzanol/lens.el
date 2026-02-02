@@ -1503,6 +1503,8 @@ string to insert between the columns."
            (cur-line (line-number-at-pos)))
       (or (eq prev-pos (point))
           (eq (get-text-property (point) 'lens-border-box-content) unique-id)
+          ;; Do not run if a modification was made
+          (memq #'lens--field-modification-callback (default-value 'post-command-hook))
           ;; If we moved horizontally off of the line, go to the previous/next line
           (if (eq cur-line (line-number-at-pos prev-pos))
               (if (< (point) prev-pos)
