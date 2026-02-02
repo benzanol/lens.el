@@ -27,9 +27,6 @@ redisplay will be cancelled.")
 (defvar-local lens--buffer-referencers nil
   "List of lens buffers that reference the current buffer.")
 
-(defvar lens--modified-fields nil
-  "List of (:buffer BUF :pos MARKER :undo? BOOL).")
-
 
 ;;; Utilities
 ;;;; Let macro
@@ -146,7 +143,7 @@ This allows for the following syntax:
   "Perform the changes in BODY without any consequences."
   `(let ((inhibit-read-only t)
          (inhibit-modification-hooks t)
-         (inhibit-point-motion-hooks t))
+         (cursor-sensor-inhibit t))
      (atomic-change-group ,@body)))
 
 (defun lens--make-symbol (name &rest props)
@@ -203,7 +200,7 @@ representing the bounds of the region.
 VAL and PRED can be used to search for a particular region,
 following the same convention as `text-property-search-forward'."
 
-  (let* ((inhibit-point-motion-hooks t)
+  (let* ((cursor-sensor-inhibit t)
          (beg (text-property-search-forward beg-prop val pred))
          (beg-val (when beg (prop-match-value beg)))
          (end (when beg-val (text-property-search-forward end-prop beg-val #'eq))))
@@ -217,7 +214,7 @@ following the same convention as `text-property-search-forward'."
 
 The bounds of the region are specified by BEG-PROP and END-PROP,
 as described by `lens--region-search-forward'."
-  (let* ((inhibit-point-motion-hooks t)
+  (let* ((cursor-sensor-inhibit t)
          (start (point))
          (hb nil) (he nil)
          (pred (lambda (_nil val)
@@ -251,7 +248,37 @@ If NOERROR is nil, throw an error if no lens is found."
       (unless noerror (error "No lens at point"))))
 
 
+;;;; Batch post command
+
+(defvar lens--batch-post-commands nil
+  "An alist mapping functions to lists of arguments.
+
+Each call to `lens-batch-post-command' with a particular command and arg
+is associated with a single entry in the cdr of command. So, if 3 calls
+are made with the same command, the cdr will be a list of 3 elements,
+the 3 arguments (in REVERSE order).
+
+Each command will be called with the entire list of commands, (in the
+correct order, the reverse of what was stored.)")
+
+(defun lens-batch-post-command (command arg)
+  (push arg (alist-get command lens--batch-post-commands))
+  (add-hook 'post-command-hook #'lens--batch-post-command-callback))
+
+(defun lens--batch-post-command-callback ()
+  (remove-hook 'post-command-hook #'lens--batch-post-command-callback)
+  (let ((cmds (nreverse lens--batch-post-commands)))
+    (setq lens--batch-post-commands nil)
+
+    (dolist (command cmds)
+      (with-demoted-errors "Error in batch command: %S"
+        (funcall (car command) (nreverse (cdr command)))))))
+
+
 ;;;; Fields
+
+(defvar lens--modified-fields nil
+  "List of (:buffer BUF :pos MARKER :undo? BOOL).")
 
 (bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
 (defun lens--field (text onchange &optional head foot props)
@@ -991,6 +1018,11 @@ Create a ui context with the following properties:
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
 
+(defvar lens--ui-callbacks nil
+  "An alist mapping a ui-id to a list of callbacks.
+
+Each callback takes a single argument, the state that they will mutate.")
+
 (defun lens--follow-key-path (state path)
   (if (null path) state
     (lens--follow-key-path
@@ -1016,8 +1048,8 @@ Create a ui context with the following properties:
    (funcall run)
 
    ;; Generate the ui for the new state
-   (:let ui-func (plist-get root-ctx :ui-func))
-   (:let new-state (lens--generate-ui ui-func nil lens--callback-state ui-id))
+   (:let new-state (lens--generate-ui (plist-get root-ctx :ui-func) nil
+                                      lens--callback-state ui-id))
 
    ;; Apply the new state
    (lens-modify region new-state nil #'lens--ui-renderer)))
@@ -1188,9 +1220,9 @@ with the following properties:
 
 (lens-defcomponent counter (ctx label)
   (:use-state count set-count 1)
-  (:use-effect count (lambda () (message "Counter %s changed to %s" label count)))
+  (:use-effect count (lambda (_start _end) (message "Counter %s changed to %s" label count)))
   (list `(string :count ,(format "%s: >%s<" label count))
-        `(button :increment "+" ,(lambda () (set-count (1+ count))))))
+        `(button :increment "++++++" ,(lambda () (set-count (1+ count))))))
 
 
 ;;;; Components
@@ -1441,8 +1473,36 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
 
 ;;;; Border text box
 
+(defun lens--border-box-callback (body line-idx new-line-text cursor-col)
+  (let ((new-content "")
+        deleted-bol new-cursor line)
+
+    (dotimes (i (length body))
+
+      ;; If the user deleted the BOL character, delete a character from the previous line
+      (setq deleted-bol (and (eq i line-idx)
+                             (not (get-text-property 0 'lens-border-box-bol new-line-text))))
+      (when (and deleted-bol (not (s-blank? new-content)))
+        (setq new-content (substring new-content 0 -1)))
+      (setq line (if (eq i line-idx)
+                     (substring new-line-text (if deleted-bol 0 1) -1)
+                   (car (nth i body))))
+
+      ;; Subtract 1 from the cursor col to account for the ~ prefix
+      (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
+                                               (if deleted-bol 0 -1))))
+
+      ;; Concat the line to the new content
+      (if (and (not (s-blank? line))
+               (get-text-property (1- (length line)) 'lens-textbox-newline line))
+          (setq new-content (concat new-content (substring line 0 -1) "\n"))
+        (setq new-content (concat new-content line))))
+
+    (cons new-content new-cursor)))
+
 (lens-defcomponent wrapped-box (ctx text set-text)
   (:use-state cursor set-cursor nil)
+  (:use-state unique-id set-unique-id (abs (random)))
 
   (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
               (lens--textbox-wrap
@@ -1459,62 +1519,61 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
   (:use-effect
    (list cursor-line cursor-col)
    (lambda (start end)
-     (goto-char start)
      (when (and cursor-line cursor-col)
+       (goto-char start)
        (forward-line (1+ cursor-line))
        (forward-char (+ 2 cursor-col)))))
 
-  (:flet update-line (line-idx new-line-text cursor-col)
-         (let ((new-content "")
-               deleted-bol new-cursor line)
-
-           (dotimes (i (length body))
-
-             ;; If the user deleted the BOL character, delete a character from the previous line
-             (setq deleted-bol (and (eq i line-idx)
-                                    (not (get-text-property 0 'lens-border-box-bol new-line-text))))
-             (when (and deleted-bol (not (s-blank? new-content)))
-               (setq new-content (substring new-content 0 -1)))
-             (setq line (if (eq i line-idx)
-                            (substring new-line-text (if deleted-bol 0 1) -1)
-                          (car (nth i body))))
-
-             ;; Subtract 1 from the cursor col to account for the ~ prefix
-             (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
-                                                      (if deleted-bol 0 -1))))
-
-             ;; Concat the line to the new content
-             (if (and (not (s-blank? line))
-                      (get-text-property (1- (length line)) 'lens-textbox-newline line))
-                 (setq new-content (concat new-content (substring line 0 -1) "\n"))
-               (setq new-content (concat new-content line))))
-
-           (lens--ui-callback
-            ctx
-            (lambda ()
-              (funcall set-text new-content)
-              (set-cursor new-cursor)))))
+  (:let did-change nil)
+  (:let did-enter nil)
+  (:let sensor-fns
+        (when cursor
+          (list (lambda (_win pos action)
+                  (if (eq action 'entered) (setq did-enter t)
+                    (setq did-enter nil)
+                    (run-with-timer
+                     0 nil
+                     (lambda ()
+                       (unless (or did-enter did-change)
+                         (or (and (eq (get-text-property (point) 'lens-border-box-bol) unique-id)
+                                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
+                             (and (eq (get-text-property (1- (point)) 'lens-border-box-eol) unique-id)
+                                  (text-property-search-forward 'lens-border-box-bol unique-id #'eq))
+                             (and (get-text-property (point) 'field-end)
+                                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
+                             (lens--ui-callback ctx (lambda () (set-cursor nil))))))))))))
 
   (:let border-face 'shadow)
   (:let content-props (nconc (list 'keymap map)
                              (unless cursor (list 'face 'shadow 'read-only t))))
 
   (string-join
-   (nconc (list (propertize header 'face border-face 'keymap map))
+   (nconc (list (propertize (substring header 0 -1)
+                            'face border-face 'keymap map))
           (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
-                   for bol-char = (propertize "~" 'lens-border-box-bol t 'rear-nonsticky t 'face border-face
+                   for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
                                               'read-only (eq line-idx 0))
-                   for eol-char = (propertize "~" 'lens-border-box-eol t 'read-only t 'face border-face)
+                   for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
                    collect
-                   (lens--field
-                    (concat bol-char content eol-char)
-                    (let ((cur-line-idx line-idx))
-                      (lambda (newtext newcursor)
-                        (update-line cur-line-idx newtext newcursor)))
-                    (propertize (substring prefix 0 -1) 'face border-face)
-                    (propertize (substring suffix 1) 'face border-face)
-                    content-props))
-          (list (propertize footer 'face border-face 'keymap map)))))
+                   (propertize
+                    (lens--field
+                     (concat bol-char
+                             (propertize (concat content eol-char)
+                                         'cursor-sensor-functions sensor-fns))
+                     (let ((cur-line-idx line-idx))
+                       (lambda (newtext newcursor)
+                         (setq did-change t)
+                         (lens--ui-callback
+                          ctx
+                          (lambda ()
+                            (let ((res (lens--border-box-callback body cur-line-idx newtext newcursor)))
+                              (funcall set-text (car res))
+                              (set-cursor (cdr res)))))))
+                     (propertize (substring prefix 0 -1) 'face border-face)
+                     (propertize (substring suffix 1 -1) 'face border-face)
+                     content-props)))
+          (list (propertize footer 'face border-face 'keymap map)))
+   (propertize "\n" 'read-only t)))
 
 
 ;;; Usable functions
