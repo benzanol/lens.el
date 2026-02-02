@@ -1374,7 +1374,7 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
        ;; Add the space to the body
        (if (not (eq (aref text idx) ?\n))
            (add-word (substring text idx (1+ idx)))
-         (add-word (apply #'propertize ">" 'lens-textbox-newline t
+         (add-word (apply #'propertize "¶" 'lens-textbox-newline t 'face 'shadow
                           (text-properties-at idx text)))
          (push "" body-lines)))
      (setq idx (1+ idx)))
@@ -1466,18 +1466,22 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
 
   (:flet update-line (line-idx new-line-text cursor-col)
          (let ((new-content "")
-               new-cursor line)
+               deleted-bol new-cursor line)
 
            (dotimes (i (length body))
 
              ;; If the user deleted the BOL character, delete a character from the previous line
-             (if (and (eq i line-idx) (not (get-text-property 0 'lens-border-box-bol new-line-text)))
-                 (progn (unless (s-blank? new-content) (setq new-content (substring new-content 0 -1)))
-                        (setq line (substring new-line-text 0 -1)))
-               (setq line (if (eq i line-idx) (substring new-line-text 1 -1) (car (nth i body)))))
+             (setq deleted-bol (and (eq i line-idx)
+                                    (not (get-text-property 0 'lens-border-box-bol new-line-text))))
+             (when (and deleted-bol (not (s-blank? new-content)))
+               (setq new-content (substring new-content 0 -1)))
+             (setq line (if (eq i line-idx)
+                            (substring new-line-text (if deleted-bol 0 1) -1)
+                          (car (nth i body))))
 
              ;; Subtract 1 from the cursor col to account for the ~ prefix
-             (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col -1)))
+             (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
+                                                      (if deleted-bol 0 -1))))
 
              ;; Concat the line to the new content
              (if (and (not (s-blank? line))
@@ -1498,7 +1502,8 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
   (string-join
    (nconc (list (propertize header 'face border-face 'keymap map))
           (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
-                   for bol-char = (propertize "~" 'lens-border-box-bol t 'rear-nonsticky t 'face border-face)
+                   for bol-char = (propertize "~" 'lens-border-box-bol t 'rear-nonsticky t 'face border-face
+                                              'read-only (eq line-idx 0))
                    for eol-char = (propertize "~" 'lens-border-box-eol t 'read-only t 'face border-face)
                    collect
                    (lens--field
