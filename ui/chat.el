@@ -18,7 +18,7 @@
                       (set-history `((,user . ,(concat ai output)) ,@(cdr history))))))))
 
   ;; Define a vector to hold the callback. Since vectors don't get
-  ;; cloned, this serves as a cell which can 
+  ;; cloned, this serves as a cell which can
   (:use-state llm-cb-cell set-llm-cb-cell (vector nil))
   (aset llm-cb-cell 0 llm-cb)
 
@@ -38,15 +38,14 @@
   `(,@(--map-indexed
        (list 'string (intern (format ":chat-%s" it-index))
              (concat (lens-text-to-box (car it)
-                                       :width (min 60 (max 10 (+ (length (car it)) 4)))
+                                       :width 60 :shrink t
                                        :title "User" :charset 'unicode
                                        :box-props '(face shadow))
                      "\n"
-                     (let ((ai (if (s-blank? (cdr it)) "..." (cdr it))))
-                       (lens-text-to-box ai
-                                         :width (min 60 (max 8 (+ (length ai) 4)))
-                                         :title "AI" :charset 'unicode
-                                         :box-props '(face shadow)))))
+                     (lens-text-to-box (if (s-blank? (cdr it)) "..." (cdr it))
+                                       :width 60 :shrink t
+                                       :title "AI" :charset 'unicode
+                                       :box-props '(face shadow))))
        (reverse history))
 
     (wrapped-box :box ,input ,set-input)

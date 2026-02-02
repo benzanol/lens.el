@@ -397,12 +397,18 @@ PROPS has the following meaningful properties:
   :cursor - The 0-index of the cursor in the original text
   :charset - unicode or ascii
   :width - The outer width (default 50)
+  :shrink - Shrink if the text is smaller than the width
   :pad - The horizontal padding on each side (default 1)
   :title - Text displayed in the top border
   :box-props - Plist of text properties applied only to the border"
   (lens-let-body
-   (:let width (or (plist-get props :width) 50))
    (:let hpad (or (plist-get props :pad) 1))
+   (:let width (or (plist-get props :width) 50))
+   (when (plist-get props :shrink)
+     (let ((longest-line (cl-loop for line in (split-string text "\n")
+                                  maximize (1+ (length line)))))
+       (setq width (min width (+ 2 (* hpad 2) longest-line)))))
+
    (:let inner-width (- width 2 (* 2 hpad)))
    (unless (> inner-width 0) (error "Text box is too thin"))
 
