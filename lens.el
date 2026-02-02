@@ -447,14 +447,19 @@ PROPS has the following meaningful properties:
    (:let cur-word-start nil)
 
    (:flet add-word (word &optional is-word)
-          (cond ((> (length word) inner-width)
+          (cond ((> (string-width word) inner-width)
                  (when (string-empty-p (car body-lines)) (pop body-lines))
-                 (while (> (length word) inner-width)
-                   (push (substring word 0 inner-width) body-lines)
-                   (setq word (substring word inner-width)))
+                 (while (> (string-width word) inner-width)
+                   (let ((idx (cl-loop for i from 1 below (length word)
+                                       when (> (string-width word 0 i) inner-width)
+                                       do (cl-return (1- i))
+                                       finally (cl-return (length word)))))
+                     (push (substring word 0 idx) body-lines)
+                     (setq word (substring word idx))))
                  (push word body-lines))
-                ((or (> (+ (length word) (length (car body-lines)) (if is-word 1 0))
+                ((or (> (+ (string-width word) (string-width (car body-lines)) (if is-word 1 0))
                         inner-width))
+                 (when (string-empty-p (car body-lines)) (pop body-lines))
                  (push word body-lines))
                 (t (setcar body-lines (concat (car body-lines) word)))))
 
@@ -503,7 +508,7 @@ PROPS has the following meaningful properties:
                              'front-sticky t
                              box-props)
                       (apply #'propertize
-                             (concat (make-string (+ (- inner-width (length it)) hpad) ?\s)
+                             (concat (make-string (+ (- inner-width (string-width it)) hpad) ?\s)
                                      vert "\n")
                              box-props))
                 body-lines)
