@@ -564,7 +564,7 @@ reinsert the lens content."
   (interactive (list (lens-at-point)))
   (lens-unfold (car region))
 
-  (pcase-let* ((`((,spec ,text ,state) ,hb ,he ,fb ,fe) region)
+  (pcase-let* ((`((,spec ,text ,_state) ,hb ,_he ,_fb ,fe) region)
                (replace (funcall (plist-get (get spec :source) :replace) text)))
     (lens-silent-edit
      (delete-region hb fe)
@@ -1336,14 +1336,29 @@ string to insert between the columns."
            (horizontal   . "-")
            (vertical     . "|"))))
 
+(defun lens-text-to-box (text &rest props)
+  (pcase-let ((`(,body ,head ,foot) (apply #'lens--textbox-wrap text props)))
+    (concat head
+            (cl-loop for (content prefix suffix) in body
+                     concat (concat prefix content suffix))
+            foot)))
+
 (defun lens--textbox-wrap (text &rest props)
-  "Returns (HEAD FOOT BODY CURSOR-LINE CURSOR-COL).
+  "Returns (BODY HEAD FOOT CURSOR-LINE CURSOR-COL).
 
 HEAD and FOOT are strings for the header and footer.
 
-BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
+BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)
+
+PROPS has the following meaningful properties:
+  :cursor - The 0-index of the cursor in the original text
+  :charset - unicode or ascii
+  :width - The outer width (default 50)
+  :pad - The horizontal padding on each side (default 1)
+  :title - Text displayed in the top border
+  :box-props - Plist of text properties applied only to the border"
   (lens-let-body
-   (:let width (or (plist-get props :width) 20))
+   (:let width (or (plist-get props :width) 50))
    (:let hpad (or (plist-get props :pad) 1))
    (:let inner-width (- width 2 (* 2 hpad)))
    (unless (> inner-width 0) (error "Text box is too thin"))
@@ -1447,28 +1462,6 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
          (apply #'propertize foot-str box-props)
          cursor-line
          cursor-col)))
-
-(defun lens--textbox-unwrap (text cursor property value)
-  "Returns (TEXT . CURSOR?)."
-  (let ((marker (when cursor (make-marker)))
-        new-cursor match)
-    (with-temp-buffer
-      (insert text)
-      (when cursor (set-marker marker (+ (point-min) cursor)))
-      ;; Remove box characters
-      (goto-char (point-min))
-      (while (setq match (text-property-search-forward property value #'eq))
-        (delete-region (prop-match-beginning match) (prop-match-end match)))
-      ;; Get the new cursor
-      (setq new-cursor (when cursor (- (marker-position marker) (point-min))))
-      ;; Replace newline markers with newlines
-      (goto-char (point-min))
-      (while (setq match (text-property-search-forward 'lens-textbox-newline t #'eq))
-        (delete-region (prop-match-beginning match) (prop-match-end match))
-        (insert "\n"))
-
-      (cons (buffer-substring-no-properties (point-min) (point-max))
-            new-cursor))))
 
 
 ;;;; Border text box
