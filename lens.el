@@ -1469,19 +1469,20 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
                new-cursor line)
 
            (dotimes (i (length body))
-             (setq line (if (eq i line-idx) (substring new-line-text 1) (car (nth i body))))
 
              ;; If the user deleted the BOL character, delete a character from the previous line
-             (when (and (eq i line-idx) (> (length new-content) 0)
-                        (not (get-text-property 0 'lens-border-box-bol new-line-text)))
-               (setq new-content (substring new-content 0 (1- (length new-content)))))
+             (if (and (eq i line-idx) (not (get-text-property 0 'lens-border-box-bol new-line-text)))
+                 (progn (unless (s-blank? new-content) (setq new-content (substring new-content 0 -1)))
+                        (setq line (substring new-line-text 0 -1)))
+               (setq line (if (eq i line-idx) (substring new-line-text 1 -1) (car (nth i body)))))
 
              ;; Subtract 1 from the cursor col to account for the ~ prefix
              (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col -1)))
 
              ;; Concat the line to the new content
-             (if (get-text-property (1- (length line)) 'lens-textbox-newline line)
-                 (setq new-content (concat new-content (substring line 0 (1- (length line))) "\n"))
+             (if (and (not (s-blank? line))
+                      (get-text-property (1- (length line)) 'lens-textbox-newline line))
+                 (setq new-content (concat new-content (substring line 0 -1) "\n"))
                (setq new-content (concat new-content line))))
 
            (lens--ui-callback
@@ -1498,14 +1499,15 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
    (nconc (list (propertize header 'face border-face 'keymap map))
           (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
                    for bol-char = (propertize "~" 'lens-border-box-bol t 'rear-nonsticky t 'face border-face)
+                   for eol-char = (propertize "~" 'lens-border-box-eol t 'read-only t 'face border-face)
                    collect
                    (lens--field
-                    (concat bol-char content)
+                    (concat bol-char content eol-char)
                     (let ((cur-line-idx line-idx))
                       (lambda (newtext newcursor)
                         (update-line cur-line-idx newtext newcursor)))
-                    (propertize (substring prefix 0 (1- (length prefix))) 'face border-face)
-                    (propertize suffix 'face border-face)
+                    (propertize (substring prefix 0 -1) 'face border-face)
+                    (propertize (substring suffix 1) 'face border-face)
                     content-props))
           (list (propertize footer 'face border-face 'keymap map)))))
 
