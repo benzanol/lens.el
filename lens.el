@@ -992,9 +992,6 @@ Create a ui context with the following properties:
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
 
-(defvar lens--nested-callback-state nil
-  "A copy of the root-level state of the ui, which should be mutated.")
-
 (defun lens--follow-key-path (state path)
   (if (null path) state
     (lens--follow-key-path
@@ -1015,8 +1012,6 @@ Create a ui context with the following properties:
 
    (:let old-state (caddr (car region)))
    (:let lens--callback-state (copy-tree old-state))
-   (:let lens--nested-callback-state (lens--follow-key-path lens--callback-state
-                                                            (plist-get ctx :path)))
 
    ;; Apply the mutations
    (funcall run)
@@ -1028,12 +1023,17 @@ Create a ui context with the following properties:
    ;; Apply the new state
    (lens-modify region new-state nil #'lens--ui-renderer)))
 
+(defmacro lens-ui-callback (ctx &rest body)
+  "Returns a callback function which performs BODY."
+  `(lambda () (interactive)
+     (lens--ui-callback ctx (lambda () ,@body))))
+
 
 ;;;; Use state
 
 (defun lens--use-state-callback (path hook-idx value)
   (let* ((root-state (or lens--callback-state
-                         (error "Called set-state outside of lens--ui-callback")))
+                         (error "Called set-state outside of a ui callback")))
          (nested-state (lens--follow-key-path root-state path))
          (hooks (plist-get nested-state :hooks))
          (hook (nth hook-idx hooks)))
@@ -1441,20 +1441,10 @@ position in that textbox of the cursor, specified by the :cursor prop."
             new-cursor))))
 
 
-;;;; Boxed text box
+;;;; Border text box
 
 (lens-defcomponent wrapped-box (ctx text set-text)
   (:use-state cursor set-cursor nil)
-
-  (:let map (make-sparse-keymap))
-  (unless cursor
-    (define-key map (kbd "<return>")
-                (lambda () (interactive)
-                  (lens--ui-callback ctx (lambda () (set-cursor (length text)))))))
-  (when cursor
-    (define-key map (kbd "<tab>")
-                (lambda () (interactive)
-                  (lens--ui-callback ctx (lambda () (set-cursor nil))))))
 
   (:pcase-let `(,lines ,cursor-line, cursor-col)
               (lens--textbox-wrap
@@ -1463,6 +1453,10 @@ position in that textbox of the cursor, specified by the :cursor prop."
                :box-props '(lens-textbox-border t read-only t)
                :title (if cursor "Tab to unfocus" "Enter to focus")
                :charset 'unicode))
+
+  (:let map (if cursor
+                `(keymap (escape . ,(lens-ui-callback ctx (set-cursor nil))))
+              `(keymap (return . ,(lens-ui-callback ctx (set-cursor (length text)))))))
 
   (dolist (line lines)
     (put-text-property 0 (length line) 'keymap map line)
