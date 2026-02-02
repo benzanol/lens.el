@@ -1524,28 +1524,31 @@ BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
        (forward-line (1+ cursor-line))
        (forward-char (+ 2 cursor-col)))))
 
+  (:let border-face 'shadow)
+  (:let content-props (nconc (list 'keymap map)
+                             (unless cursor (list 'face 'shadow 'read-only t))))
+
   (:let did-change nil)
   (:let did-enter nil)
   (:let sensor-fns
         (when cursor
-          (list (lambda (_win pos action)
+          (list (lambda (_win prev-pos action)
                   (if (eq action 'entered) (setq did-enter t)
                     (setq did-enter nil)
                     (run-with-timer
                      0 nil
                      (lambda ()
                        (unless (or did-enter did-change)
-                         (or (and (eq (get-text-property (point) 'lens-border-box-bol) unique-id)
+                         (or (when (eq (line-number-at-pos prev-pos) (line-number-at-pos))
+                               (or (and (< (point) prev-pos)
+                                        (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
+                                   (and (> (point) prev-pos)
+                                        (text-property-search-forward 'lens-border-box-bol unique-id #'eq))))
+                             (and (eq (get (get-text-property (point) 'field-end) 'lens-field-props)
+                                      content-props)
                                   (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
-                             (and (eq (get-text-property (1- (point)) 'lens-border-box-eol) unique-id)
-                                  (text-property-search-forward 'lens-border-box-bol unique-id #'eq))
-                             (and (get-text-property (point) 'field-end)
-                                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
-                             (lens--ui-callback ctx (lambda () (set-cursor nil))))))))))))
-
-  (:let border-face 'shadow)
-  (:let content-props (nconc (list 'keymap map)
-                             (unless cursor (list 'face 'shadow 'read-only t))))
+                             ;; (lens--ui-callback ctx (lambda () (set-cursor nil)))
+                             (goto-char prev-pos))))))))))
 
   (string-join
    (nconc (list (propertize (substring header 0 -1)
