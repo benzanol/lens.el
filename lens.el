@@ -85,14 +85,12 @@ This allows for the following syntax:
         exprs func)
     ;; Go through the expressions in reverse
     (dolist (line (reverse body))
-      (cond ((and (listp line)
-                  (setq func (alist-get (car line) lens--let-keywords)))
-             (setq exprs `((,func (,(cdr line))
-                                  ,@exprs))))
-            ((and (listp line)
-                  (setq func (alist-get (car line) custom)))
+      (cond ((not (listp line)) (push line exprs))
+            ((setq func (alist-get (car line) lens--let-keywords))
+             (setq exprs `((,func (,(cdr line)) ,@exprs))))
+            ((setq func (alist-get (car line) custom))
              (setq exprs (apply func exprs (cdr line))))
-            ((push line exprs))))
+            (t (push line exprs))))
     (if (> (length exprs) 1) (cons #'progn exprs) (car exprs))))
 
 
@@ -251,6 +249,91 @@ following the same convention as `text-property-search-forward'."
 If NOERROR is nil, throw an error if no lens is found."
   (or (lens--region-at-point 'lens-begin 'lens-end)
       (unless noerror (error "No lens at point"))))
+
+
+;;;; Fields
+
+(bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
+(defun lens--field (text onchange &optional head foot props)
+  "Create a controlled, modifyable region of text.
+
+TEXT is the initial content of the region. ONCHANGE is a function
+to be called with the new content every time the region is
+modified.
+
+The region will be bounded before and after by a read-only header
+and footer. HEAD and FOOT can indicate the text of the header and
+footer.
+
+Every time the field is modified, it will be marked as modified
+in `lens--modified-fields'. Then, in the `post-command-hook', the
+new region content will be edited to have the correct properties,
+and then the ONCHANGE function will be called.
+
+PROPS is a plist of text properties that will be applied to the text of
+the field."
+  (setq head (or head (propertize "---\n" 'face 'lens-field-header 'font-lock-face 'lens-field-header))
+        foot (or foot (propertize "\n---" 'face 'lens-field-header 'font-lock-face 'lens-field-header)))
+  (let* ((field (lens--make-symbol "field"))
+         (hooks '(lens--field-modification-hook)))
+    (fset field onchange)
+    (put field 'lens-field-props props)
+    (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
+
+    (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
+            (apply #'propertize text
+                   'modification-hooks hooks 'insert-behind-hooks hooks
+                   props)
+            (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
+
+(defun lens--field-modification-hook (beg _end)
+  "Mark the field starting at BEG as modified."
+
+  (push (list :buffer (current-buffer)
+              :pos (set-marker (make-marker) beg)
+              ;; If it was modified by an undo action, mark it as such
+              :undo (when (--find (eq (cadr it) #'primitive-undo) (backtrace-frames)) t))
+        lens--modified-fields)
+  (add-hook 'post-command-hook #'lens--field-modification-callback))
+
+(defun lens--field-modification-callback ()
+  "Perform all necessary actions to update the modified fields.
+
+This function is expected to be called in the
+`post-command-hook', after one or more fields were modified by
+the previous command, as described in `lens--field'."
+
+  (remove-hook 'post-command-hook #'lens--field-modification-callback)
+  (let (saved-lenses)
+    (dolist (plist (prog1 lens--modified-fields (setq lens--modified-fields nil)))
+      (with-current-buffer (plist-get plist :buffer)
+        (lens-silent-edit
+         (if (plist-get plist :undo)
+             ;; If it was an undo action, we only need to update the restored lens
+             (pcase-let ((`(,lens ,_hb ,_he ,_fb ,_fe) (lens-at-point t)))
+               (when (and lens (not (memq lens saved-lenses)))
+                 (push lens saved-lenses)
+                 (funcall (plist-get (get (car lens) :source) :update) (cadr lens))))
+
+           ;; Perform the procedure in case there was a non-undo modification
+           (pcase-let ((`(,field ,hb ,he ,fb ,fe)
+                        (save-excursion
+                          (goto-char (plist-get plist :pos))
+                          (lens--region-at-point 'field-begin 'field-end))))
+             (when field
+               ;; Make sure the entire text has the correct properties
+               (dolist (prop '(modification-hooks insert-behind-hooks))
+                 (put-text-property he fb prop '(lens--field-modification-hook)))
+               (let ((props (get field 'lens-field-props)))
+                 (while props (put-text-property he fb (pop props) (pop props))))
+
+               ;; Determine whether the point was inside of the field content
+               (let (cursor)
+                 (when (and (>= (point) he) (<= (point) fb))
+                   (setq cursor (- (point) he)))
+                 (funcall field (buffer-substring he fb) cursor))
+
+               (lens--refresh-buffer hb fe)))))))))
 
 
 ;;; Lens Lifecycle
@@ -665,90 +748,6 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
           (if (null (get-file-buffer file)) (write-region text nil file)
             (with-current-buffer (get-file-buffer file) (save-buffer))))
         :title (lambda () (f-relative file default-directory))))
-
-
-;;;; Fields
-
-(bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
-(defun lens--field (text onchange &optional head foot props head-face)
-  "Create a controlled, modifyable region of text.
-
-TEXT is the initial content of the region. ONCHANGE is a function
-to be called with the new content every time the region is
-modified.
-
-The region will be bounded before and after by a read-only header
-and footer. HEAD and FOOT can indicate the text of the header and
-footer.
-
-Every time the field is modified, it will be marked as modified
-in `lens--modified-fields'. Then, in the `post-command-hook', the
-new region content will be edited to have the correct properties,
-and then the ONCHANGE function will be called.
-
-PROPS is a plist of text properties that will be applied to the text of
-the field."
-  (setq head (or head (propertize "---\n" 'face 'lens-field-header 'font-lock-face 'lens-field-header))
-        foot (or foot (propertize "\n---" 'face 'lens-field-header 'font-lock-face 'lens-field-header)))
-  (let* ((field (lens--make-symbol "field"))
-         (hooks '(lens--field-modification-hook)))
-    (fset field onchange)
-    (put field 'lens-field-props props)
-    (put-text-property (1- (length head)) (length head) 'insert-behind-hooks hooks head)
-
-    (concat (lens--make-sticky (propertize head 'field-begin field 'read-only t))
-            (apply #'propertize text
-                   'modification-hooks hooks 'insert-behind-hooks hooks
-                   props)
-            (lens--make-sticky (propertize foot 'field-end field 'read-only t)))))
-
-(defun lens--field-modification-hook (beg _end)
-  "Mark the field starting at BEG as modified."
-
-  (push (list :buffer (current-buffer) :pos (set-marker (make-marker) beg)
-              ;; If it was modified by an undo action, mark it as such
-              :undo (when (--find (eq (cadr it) #'primitive-undo) (backtrace-frames)) t))
-        lens--modified-fields)
-  (add-hook 'post-command-hook #'lens--field-modification-callback))
-
-(defun lens--field-modification-callback ()
-  "Perform all necessary actions to update the modified fields.
-
-This function is expected to be called in the
-`post-command-hook', after one or more fields were modified by
-the previous command, as described in `lens--field'."
-
-  (remove-hook 'post-command-hook #'lens--field-modification-callback)
-  (let (saved-lenses)
-    (dolist (plist (prog1 lens--modified-fields (setq lens--modified-fields nil)))
-      (with-current-buffer (plist-get plist :buffer)
-        (lens-silent-edit
-         (if (plist-get plist :undo)
-             ;; If it was an undo action, we only need to update the restored lens
-             (pcase-let ((`(,lens ,_hb ,_he ,_fb ,_fe) (lens-at-point t)))
-               (when (and lens (not (memq lens saved-lenses)))
-                 (push lens saved-lenses)
-                 (funcall (plist-get (get (car lens) :source) :update) (cadr lens))))
-
-           ;; Perform the procedure in case there was a proper modification
-           (pcase-let ((`(,field ,hb ,he ,fb ,fe)
-                        (save-excursion
-                          (goto-char (plist-get plist :pos))
-                          (lens--region-at-point 'field-begin 'field-end))))
-             (when field
-               ;; Make sure the entire text has the correct properties
-               (dolist (prop '(modification-hooks insert-behind-hooks))
-                 (put-text-property he fb prop '(lens--field-modification-hook)))
-               (let ((props (get field 'lens-field-props)))
-                 (while props (put-text-property he fb (pop props) (pop props))))
-
-               ;; Determine whether the point was inside of the field content
-               (let (cursor)
-                 (when (and (>= (point) he) (<= (point) fb))
-                   (setq cursor (- (point) he)))
-                 (funcall field (buffer-substring he fb) cursor))
-
-               (lens--refresh-buffer hb fe)))))))))
 
 
 ;;;; Raw display
@@ -1306,10 +1305,11 @@ string to insert between the columns."
            (vertical     . "|"))))
 
 (defun lens--textbox-wrap (text &rest props)
-  "Returns (STRING LINE COL).
+  "Returns (HEAD FOOT BODY CURSOR-LINE CURSOR-COL).
 
-STRING is the text wrapped in a border. LINE and COL specify the
-position in that textbox of the cursor, specified by the :cursor prop."
+HEAD and FOOT are strings for the header and footer.
+
+BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)"
   (lens-let-body
    (:let width (or (plist-get props :width) 20))
    (:let hpad (or (plist-get props :pad) 1))
@@ -1400,23 +1400,21 @@ position in that textbox of the cursor, specified by the :cursor prop."
    ;; Wrap the lines
    (:let vert (alist-get 'vertical chars))
    (:let box-props (plist-get props :box-props))
-   (:let wrapped-lines
-         (--map (concat (apply #'propertize (concat vert (make-string hpad ?\s))
-                               'rear-nonsticky t
-                               'front-sticky t
-                               box-props)
-                        it
-                        (apply #'propertize
-                               (concat (make-string (+ (- inner-width (length it)) hpad) ?\s)
-                                       vert "\n")
-                               box-props))
-                body-lines))
 
-   (list (nconc (list (apply #'propertize head-str box-props))
-                wrapped-lines
-                (list (apply #'propertize foot-str box-props)))
-         (when cursor (1+ cursor-line))
-         (when cursor (+ cursor-col 1 hpad)))))
+   (list (--map (list it
+                      (apply #'propertize (concat vert (make-string hpad ?\s))
+                             'rear-nonsticky t
+                             'front-sticky t
+                             box-props)
+                      (apply #'propertize
+                             (concat (make-string (+ (- inner-width (length it)) hpad) ?\s)
+                                     vert "\n")
+                             box-props))
+                body-lines)
+         (apply #'propertize head-str box-props)
+         (apply #'propertize foot-str box-props)
+         cursor-line
+         cursor-col)))
 
 (defun lens--textbox-unwrap (text cursor property value)
   "Returns (TEXT . CURSOR?)."
@@ -1446,43 +1444,70 @@ position in that textbox of the cursor, specified by the :cursor prop."
 (lens-defcomponent wrapped-box (ctx text set-text)
   (:use-state cursor set-cursor nil)
 
-  (:pcase-let `(,lines ,cursor-line, cursor-col)
+  (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
               (lens--textbox-wrap
                text :width 30
                :cursor cursor
                :box-props '(lens-textbox-border t read-only t)
-               :title (if cursor "Tab to unfocus" "Enter to focus")
+               :title (if cursor "Esc to unfocus" "Enter to focus")
                :charset 'unicode))
 
   (:let map (if cursor
                 `(keymap (escape . ,(lens-ui-callback ctx (set-cursor nil))))
               `(keymap (return . ,(lens-ui-callback ctx (set-cursor (length text)))))))
 
-  (dolist (line lines)
-    (put-text-property 0 (length line) 'keymap map line)
-    (unless cursor
-      (put-text-property 0 (length line) 'read-only t line)
-      (put-text-property 0 (length line) 'face 'shadow line)
-      (put-text-property 0 (length line) 'font-lock-face 'shadow line)))
-
   (:use-effect
    (list cursor-line cursor-col)
    (lambda (start end)
+     (goto-char start)
      (when (and cursor-line cursor-col)
-       (goto-char start)
-       (forward-line cursor-line)
-       (forward-char cursor-col))))
+       (forward-line (1+ cursor-line))
+       (forward-char (+ 2 cursor-col)))))
 
-  (lens--field (string-join (butlast (cdr lines)))
-               (lambda (newtext newcursor)
-                 (let ((unwrapped (lens--textbox-unwrap newtext newcursor 'lens-textbox-border t)))
-                   (lens--ui-callback
-                    ctx
-                    (lambda ()
-                      (funcall set-text (car unwrapped))
-                      (set-cursor (cdr unwrapped))))))
-               (car lines)
-               (car (last lines))))
+  (:flet update-line (line-idx new-line-text cursor-col)
+         (let ((new-content "")
+               new-cursor line)
+
+           (dotimes (i (length body))
+             (setq line (if (eq i line-idx) (substring new-line-text 1) (car (nth i body))))
+
+             ;; If the user deleted the BOL character, delete a character from the previous line
+             (when (and (eq i line-idx) (> (length new-content) 0)
+                        (not (get-text-property 0 'lens-border-box-bol new-line-text)))
+               (setq new-content (substring new-content 0 (1- (length new-content)))))
+
+             ;; Subtract 1 from the cursor col to account for the ~ prefix
+             (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col -1)))
+
+             ;; Concat the line to the new content
+             (if (get-text-property (1- (length line)) 'lens-textbox-newline line)
+                 (setq new-content (concat new-content (substring line 0 (1- (length line))) "\n"))
+               (setq new-content (concat new-content line))))
+
+           (lens--ui-callback
+            ctx
+            (lambda ()
+              (funcall set-text new-content)
+              (set-cursor new-cursor)))))
+
+  (:let border-face 'shadow)
+  (:let content-props (nconc (list 'keymap map)
+                             (unless cursor (list 'face 'shadow 'read-only t))))
+
+  (string-join
+   (nconc (list (propertize header 'face border-face 'keymap map))
+          (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
+                   for bol-char = (propertize "~" 'lens-border-box-bol t 'rear-nonsticky t 'face border-face)
+                   collect
+                   (lens--field
+                    (concat bol-char content)
+                    (let ((cur-line-idx line-idx))
+                      (lambda (newtext newcursor)
+                        (update-line cur-line-idx newtext newcursor)))
+                    (propertize (substring prefix 0 (1- (length prefix))) 'face border-face)
+                    (propertize suffix 'face border-face)
+                    content-props))
+          (list (propertize footer 'face border-face 'keymap map)))))
 
 
 ;;; Usable functions
