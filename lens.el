@@ -6,6 +6,12 @@
 (require 'text-property-search)
 
 
+(defgroup lens nil
+  "Customization group for lens."
+  :prefix "lens-"
+  :group 'tools)
+
+
 ;;; Variables
 ;;;; User Variables
 
@@ -406,7 +412,7 @@ PROPS has the following meaningful properties:
    (:let width (or (plist-get props :width) 50))
    (when (plist-get props :shrink)
      (let ((longest-line (cl-loop for line in (split-string text "\n")
-                                  maximize (1+ (length line)))))
+                                  maximize (1+ (string-width line)))))
        (setq width (min width (+ 2 (* hpad 2) longest-line)))))
 
    (:let inner-width (- width 2 (* 2 hpad)))
@@ -1477,6 +1483,43 @@ string to insert between the columns."
 
 ;;;; Border text box
 
+(defcustom lens-box-enter-hook nil
+  "Hook run after entering a box."
+  :group 'lens
+  :type 'hook)
+
+(defcustom lens-box-exit-hook nil
+  "Hook run after exiting a box."
+  :group 'lens
+  :type 'hook)
+
+(defvar-local lens--focused-border-box nil
+  "The focused border box in the current buffer, or nil.")
+
+(defun lens--border-box-fix-cursor ()
+  "When a box is active, this set as a local `post-command-hook'."
+  (when lens--focused-border-box
+    (-let (((&plist :last-point prev-pos :unique-id unique-id) lens--focused-border-box)
+           (cur-line (line-number-at-pos)))
+      (or (eq prev-pos (point))
+          (eq (get-text-property (point) 'lens-border-box-content) unique-id)
+          ;; If we moved horizontally off of the line, go to the previous/next line
+          (if (eq cur-line (line-number-at-pos prev-pos))
+              (if (< (point) prev-pos)
+                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+                (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+                    ;; The cursor is allowed to be at the end of the last line
+                    (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
+            ;; If we moved to a different line, try to find the end of the line
+            (goto-char (pos-eol))
+            (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+                 ;; If we went off the end of the textbox
+                 (eq cur-line (line-number-at-pos))))
+          ;; If everything else failed, go back to the last known position
+          (progn (goto-char prev-pos)
+                 (message "Press ESC to exit the textbox")))
+      (plist-put lens--focused-border-box :last-point (point)))))
+
 (defun lens--border-box-callback (body line-idx new-line-text cursor-col)
   (let ((new-content "")
         deleted-bol new-cursor line)
@@ -1508,65 +1551,47 @@ string to insert between the columns."
   (:use-state cursor set-cursor nil)
   (:use-state unique-id set-unique-id (abs (random)))
 
+  (:let border-face 'shadow)
+
   (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
               (lens--textbox-wrap
                text :width 30
                :cursor cursor
-               :box-props '(lens-textbox-border t read-only t)
+               :box-props `(lens-textbox-border t read-only t face ,border-face)
                :title (if cursor "Esc to unfocus" "Enter to focus")
                :charset 'unicode))
 
+  (:flet focus ()
+         (set-cursor (length text))
+         (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
+         (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
+  (:flet unfocus ()
+         (set-cursor nil)
+         (setq lens--focused-border-box nil)
+         (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
   (:let map (if cursor
-                `(keymap (escape . ,(lens-ui-callback ctx (set-cursor nil))))
-              `(keymap (return . ,(lens-ui-callback ctx (set-cursor (length text)))))))
+                `(keymap (escape . ,(lens-ui-callback ctx (unfocus))))
+              `(keymap (return . ,(lens-ui-callback ctx (focus))))))
 
   (:use-effect
    (list cursor-line cursor-col)
    (lambda (start end)
-     (when (and cursor-line cursor-col)
+     (when (and cursor-line cursor-col lens--focused-border-box)
        (goto-char start)
        (forward-line (1+ cursor-line))
-       (forward-char (+ 2 cursor-col)))))
+       (forward-char (+ 2 cursor-col))
+       (plist-put lens--focused-border-box :last-point (point)))))
 
-  (:let border-face 'shadow)
-  (:let content-props (nconc (list 'keymap map)
-                             (unless cursor (list 'face 'shadow 'read-only t))))
-
-  (:let did-change nil)
-  (:let did-enter nil)
-  (:let sensor-fns
-        (when cursor
-          (list (lambda (_win prev-pos action)
-                  (if (eq action 'entered) (setq did-enter t)
-                    (setq did-enter nil)
-                    (run-with-timer
-                     0 nil
-                     (lambda ()
-                       (unless (or did-enter did-change)
-                         (or (when (eq (line-number-at-pos prev-pos) (line-number-at-pos))
-                               (or (and (< (point) prev-pos)
-                                        (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
-                                   (and (> (point) prev-pos)
-                                        (text-property-search-forward 'lens-border-box-bol unique-id #'eq))))
-                             (and (eq (get (get-text-property (point) 'field-end) 'lens-field-props)
-                                      content-props)
-                                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq))
-                             ;; (lens--ui-callback ctx (lambda () (set-cursor nil)))
-                             (goto-char prev-pos))))))))))
-
-  (string-join
-   (nconc (list (propertize (substring header 0 -1)
-                            'face border-face 'keymap map))
-          (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
-                   for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
-                                              'read-only (eq line-idx 0))
-                   for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
-                   collect
-                   (propertize
+  (propertize
+   (string-join
+    (nconc (list (substring header 0 -1))
+           (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
+                    for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
+                                               'read-only (eq line-idx 0))
+                    for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
+                    collect
                     (lens--field
-                     (concat bol-char
-                             (propertize (concat content eol-char)
-                                         'cursor-sensor-functions sensor-fns))
+                     (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
                      (let ((cur-line-idx line-idx))
                        (lambda (newtext newcursor)
                          (setq did-change t)
@@ -1576,11 +1601,12 @@ string to insert between the columns."
                             (let ((res (lens--border-box-callback body cur-line-idx newtext newcursor)))
                               (funcall set-text (car res))
                               (set-cursor (cdr res)))))))
-                     (propertize (substring prefix 0 -1) 'face border-face)
-                     (propertize (substring suffix 1 -1) 'face border-face)
-                     content-props)))
-          (list (propertize footer 'face border-face 'keymap map)))
-   (propertize "\n" 'read-only t)))
+                     (substring prefix 0 -1)
+                     (substring suffix 1 -1)
+                     (unless cursor (list 'face 'shadow 'read-only t))))
+           (list footer))
+    (propertize "\n" 'read-only t))
+   'keymap map))
 
 
 ;;; Usable functions
