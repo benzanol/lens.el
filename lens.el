@@ -1060,6 +1060,12 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 ;;;; Rerenderer
 
 (defun lens--ui-string-rows (state key-path)
+  "Returns a list of rows.
+
+Each row has the form ((PATH ELEMENT STATE-HOOKS) . TEXT).
+
+This format is designed to be suitable for diffing, as used in
+`lens--ui-rerender'."
   (let* ((content (plist-get state :content))
          (element (plist-get state :element)))
     (if (stringp content)
@@ -1575,6 +1581,11 @@ string to insert between the columns."
                 `(keymap (escape . ,(lens-ui-callback ctx (unfocus))))
               `(keymap (return . ,(lens-ui-callback ctx (focus))))))
 
+  ;; Run the hooks when focus changes
+  (:use-effect
+   (not cursor)
+   (lambda (_ _) (run-hook-with-args (if cursor 'lens-box-enter-hook 'lens-box-exit-hook))))
+
   (:use-effect
    (list cursor-line cursor-col)
    (lambda (start end)
@@ -1596,7 +1607,6 @@ string to insert between the columns."
                      (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
                      (let ((cur-line-idx line-idx))
                        (lambda (newtext newcursor)
-                         (setq did-change t)
                          (lens--ui-callback
                           ctx
                           (lambda ()
