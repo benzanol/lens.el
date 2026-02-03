@@ -1059,6 +1059,17 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 
 ;;;; Rerenderer
 
+(defun lens--ui-state-to-string (state)
+  (cl-loop for ((keys) . string) in (lens--ui-string-rows state nil)
+           for newline = (propertize "\n" 'read-only t 'lens-element-key keys)
+           concat (concat string newline)))
+
+(defun lens--ui-nested-use-states (state)
+  (let ((content (plist-get state :content)))
+    (cons (--filter (eq (car it) :use-state) (plist-get state :hooks))
+          (when (listp content)
+            (--map (lens--ui-nested-use-states (cdr it)) content)))))
+
 (defun lens--ui-string-rows (state key-path)
   "Returns a list of rows.
 
@@ -1067,11 +1078,13 @@ Each row has the form ((PATH ELEMENT STATE-HOOKS) . TEXT).
 This format is designed to be suitable for diffing, as used in
 `lens--ui-rerender'."
   (let* ((content (plist-get state :content))
-         (element (plist-get state :element)))
-    (if (stringp content)
-        (list (cons (list key-path element
-                          (--filter (eq (car it) :use-state) (plist-get state :hooks)))
-                    content))
+         (element (plist-get state :element))
+         (renderer (plist-get state :renderer)))
+    (if (or (stringp content) renderer)
+        (list (cons (list key-path element (lens--ui-nested-use-states state))
+                    (if (not renderer) content
+                      (funcall renderer
+                               (--map (lens--ui-state-to-string (cdr it)) content)))))
       (--mapcat (lens--ui-string-rows (cdr it) (append key-path (list (car it))))
                 content))))
 
@@ -1262,8 +1275,11 @@ Each callback takes a single argument, the state that they will mutate.")
 ;;;; Use effect
 
 (defun lens--ui-run-effects (state path-to-posn &optional key-path)
-  (let ((posn (or (gethash key-path path-to-posn)
-                  (error "No position found for key path %s" key-path))))
+  (let ((posn (when (plist-get state :hooks)
+                ;; Find the first parent of key-path which has a position
+                (or (cl-loop for i downfrom (length key-path)
+                             thereis (gethash (-slice key-path 0 i) path-to-posn))
+                    (error "No position found for effect: %s" key-path)))))
     (dolist (hook (plist-get state :hooks))
       (when (and (eq (car hook) :use-effect)
                  (nth 3 hook))
@@ -1340,10 +1356,8 @@ with the following properties:
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
-            (cl-loop for ((key) . string) in (lens--ui-string-rows state nil)
-                     for newline = (propertize "\n" 'read-only t 'lens-element-key key)
-                     concat (concat string newline) into str
-                     finally return (concat (propertize "\n" 'lens-element-key 'START) str))))))
+            (concat (propertize "\n" 'lens-element-key 'START)
+                    (lens--ui-state-to-string state))))))
 
 
 ;;;; Defui
@@ -1364,32 +1378,17 @@ with the following properties:
       lambda (body dependencies effect)
       `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
                           ,dependencies ,effect)
-        ,@body))]
+        ,@body))
+     (:use-renderer
+      lambda (body ctx renderer)
+      (let ((ctx-expr '(or lens--current-ctx (error "No containing lens context"))))
+        (cons `(plist-put (plist-get ,ctx-expr :state) :renderer ,renderer) body)))]
     ,@body))
 
 (defmacro lens-defui (name arglist &rest body)
   (declare (indent 2))
   `(setf (alist-get ',name lens-ui-alist)
          (lambda ,arglist (lens-ui-body ,@body))))
-
-(lens-defui test (ctx)
-  (:use-state count set-count 1)
-  (:use-effect count
-               (lambda (ref)
-                 (message "Effect!")))
-
-  (:use-state text set-text "hi")
-
-  (list `(wrapped-box :box1 ,text ,set-text)
-        `(wrapped-box :box2 ,text ,set-text)
-        `(counter :c1 "hi")
-        `(counter :c2 "yo")))
-
-(lens-defcomponent counter (ctx label)
-  (:use-state count set-count 1)
-  (:use-effect count (lambda (_start _end) (message "Counter %s changed to %s" label count)))
-  (list `(string :count ,(format "%s: >%s<" label count))
-        `(button :increment "++++++" ,(lambda () (set-count (1+ count))))))
 
 
 ;;;; Components
@@ -1447,7 +1446,7 @@ with the following properties:
               'read-only t))
 
 
-;;;; Column
+;;;; Columns
 
 (defun lens-string-width (str)
   "Calculate the pixel width of a string STR."
@@ -1462,7 +1461,7 @@ with the following properties:
 
 COLS is the list of strings to align, and SEP is an additional
 string to insert between the columns."
-  (let* ((splits (--map (split-string it "\n") cols))
+  (let* ((splits (--map (split-string (replace-regexp-in-string "\n\\'" "" it) "\n") cols))
          (line-ct (apply #'max (-map #'length splits)))
          (lines (make-list line-ct ""))
          max-w cell-text)
@@ -1478,13 +1477,18 @@ string to insert between the columns."
                       (make-string (- max-w (lens-string-width cell-text)) ?\s)))))
     (string-join lines (propertize "\n" 'read-only t))))
 
-(lens-defcomponent row (cb &rest cols)
+(lens-defcomponent columns (ctx &rest columns)
   ;; Ensure that all are valid columns
-  (dolist (elem cols)
+  (dolist (elem columns)
     (unless (get (car elem) 'lens-component-can-be-column)
       (error "Invalid column component: %s" (car elem))))
-  (lens--join-columns (--map (lens--ui-element-to-string it cb) cols)
-                      (propertize " " 'read-only t)))
+
+  (:use-renderer ctx (lambda (cols) (lens--join-columns cols (propertize " " 'read-only t))))
+  columns)
+
+(lens-defcomponent rows (ctx &rest rows)
+  :can-be-column t
+  rows)
 
 
 ;;;; Border text box
@@ -1556,6 +1560,8 @@ string to insert between the columns."
     (cons new-content new-cursor)))
 
 (lens-defcomponent wrapped-box (ctx text set-text)
+  :can-be-column t
+
   (:use-state cursor set-cursor nil)
   (:use-state unique-id set-unique-id (abs (random)))
 
@@ -1592,7 +1598,8 @@ string to insert between the columns."
      (when (and cursor-line cursor-col lens--focused-border-box)
        (goto-char start)
        (forward-line (1+ cursor-line))
-       (forward-char (+ 2 cursor-col))
+       (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+       (forward-char cursor-col)
        (plist-put lens--focused-border-box :last-point (point)))))
 
   (propertize
