@@ -47,7 +47,7 @@
              (concat (nth 2 it) "\n" (nth 3 it)))
        (reverse history))
 
-    (wrapped-box :box ,input ,set-input ,send-fn)
+    (wrapped-box :box ,input ,set-input :onenter ,send-fn :width 50)
 
     (button :send-button "Send" ,send-fn)))
 

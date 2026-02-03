@@ -1409,7 +1409,7 @@ with the following properties:
 (defmacro lens-defui (name arglist &rest body)
   (declare (indent 2))
   `(setf (alist-get ',name lens-ui-alist)
-         (lambda ,arglist (lens-ui-body ,@body))))
+         (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name))))
 
 
 ;;;; Components
@@ -1424,7 +1424,8 @@ with the following properties:
       (push (cons (pop body) (pop body)) props))
 
     (apply #'list #'prog1
-           `(put ',name 'lens-component (lambda ,arglist (lens-ui-body ,@body)))
+           `(put ',name 'lens-component
+                 (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name)))
            (--map `(put ',name
                         ',(intern (concat "lens-component-"
                                           (substring (symbol-name (car it)) 1)))
@@ -1447,7 +1448,7 @@ with the following properties:
 ;;;; Button
 
 (bz/face lens-button custom-button)
-(bz/keys lens-button-keymap
+(bz/keys lens-button-map
   :sparse t
   "<return>" lens-click)
 
@@ -1458,13 +1459,14 @@ with the following properties:
     (if click (funcall click)
       (error "Nothing to click"))))
 
-(lens-defcomponent button (ctx label onclick &rest plist)
+(lens-defcomponent button (ctx label onclick &key face)
   :can-be-column t
   (propertize (format " %s " label)
               'lens-click
               (when onclick (lambda () (lens--ui-callback ctx onclick)))
-              'local-map (list 'keymap lens-button-keymap (current-local-map))
-              'font-lock-face (or (plist-get plist :face) 'lens-button)
+              'keymap lens-button-map
+              'face (or face 'lens-button)
+              'font-lock-face (or face 'lens-button)
               'read-only t))
 
 
@@ -1520,7 +1522,7 @@ string to insert between the columns."
 (defvar-local lens--focused-border-box nil
   "The focused border box in the current buffer, or nil.")
 
-(lens-defcomponent wrapped-box (ctx text set-text &optional onenter)
+(lens-defcomponent wrapped-box (ctx text set-text &key onenter width)
   :can-be-column t
 
   (:use-state cursor set-cursor nil)
@@ -1531,7 +1533,7 @@ string to insert between the columns."
 
   (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
               (lens--textbox-wrap
-               text :width 30
+               text :width (or width 30)
                :cursor cursor
                :box-props `(lens-textbox-border t read-only t face ,border-face)
                :title (if cursor "Esc to unfocus" "Enter to focus")
