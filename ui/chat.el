@@ -9,13 +9,20 @@
   (:use-state input set-input "hi")
   (:use-state history set-history nil)
 
+  (:flet make-box (title text)
+         (lens-text-to-box text
+                           :width 60 :shrink t
+                           :title title :charset 'unicode
+                           :box-props '(face shadow)))
+
   (:let llm-cb (lambda (output)
                  (lens--ui-callback
                   ctx
                   (lambda ()
-                    ;; (message "CB %s" history)
-                    (pcase-let ((`(,user . ,ai) (car history)))
-                      (set-history `((,user . ,(concat ai output)) ,@(cdr history))))))))
+                    (let ((first (car history)))
+                      (setf (cadr first) (concat (cadr first) output))
+                      (setf (nth 3 first) (make-box "AI" (cadr first)))
+                      (set-history history))))))
 
   ;; Define a vector to hold the callback. Since vectors don't get
   ;; cloned, this serves as a cell which can
@@ -25,7 +32,7 @@
   (:let send-fn
         (lambda ()
           (set-input "")
-          (set-history (cons (cons input "") history))
+          (set-history (cons (list input "" (make-box "User" input) (make-box "AI" "...")) history))
 
           (streaming-llm-request
            "openai/gpt-4.1-mini" input (reverse history)
@@ -37,18 +44,10 @@
 
   `(,@(--map-indexed
        (list 'string (intern (format ":chat-%s" it-index))
-             (concat (lens-text-to-box (car it)
-                                       :width 60 :shrink t
-                                       :title "User" :charset 'unicode
-                                       :box-props '(face shadow))
-                     "\n"
-                     (lens-text-to-box (if (s-blank? (cdr it)) "..." (cdr it))
-                                       :width 60 :shrink t
-                                       :title "AI" :charset 'unicode
-                                       :box-props '(face shadow))))
+             (concat (nth 2 it) "\n" (nth 3 it)))
        (reverse history))
 
-    (wrapped-box :box ,input ,set-input)
+    (wrapped-box :box ,input ,set-input ,send-fn)
 
     (button :send-button "Send" ,send-fn)))
 
@@ -57,7 +56,7 @@
   "Make a streaming request to OpenRouter API.
   MODEL is the model ID (e.g., \"anthropic/claude-3.5-sonnet\").
   PROMPT is the user's prompt string.
-  HISTORY is a list of (:user STRING :ai STRING) plists.
+  HISTORY is a list of (USER-STRING AI-STRING) plists.
   CALLBACK is called with each chunk of generated text, or 'done when finished."
   (let* ((api-key (getenv "OPENROUTER_API_KEY"))
          (url "https://openrouter.ai/api/v1/chat/completions")
@@ -122,13 +121,13 @@
   "Build messages array from HISTORY and PROMPT."
   (let ((messages '()))
     (dolist (entry history)
-      (when (plist-get entry :user)
+      (when (car entry)
         (push `(("role" . "user")
-                ("content" . ,(plist-get entry :user)))
+                ("content" . ,(car entry)))
               messages))
-      (when (plist-get entry :ai)
+      (when (cadr entry)
         (push `(("role" . "assistant")
-                ("content" . ,(plist-get entry :ai)))
+                ("content" . ,(cadr entry)))
               messages)))
     (push `(("role" . "user")
             ("content" . ,prompt))

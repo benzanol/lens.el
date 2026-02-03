@@ -84,25 +84,34 @@ This allows for the following syntax:
   (:use-state count set-count)
   (set-count (1+ count))"
 
-  (let ((custom (when (vectorp (car body)) (append (pop body) nil)))
-        exprs func)
+  (let ((lens--let-keywords '((:let . let)
+                              (:flet . cl-flet)
+                              (:when-let . when-let)
+                              (:pcase-let . pcase-let)
+                              (:-let . -let)))
+        (custom (when (vectorp (car body)) (append (pop body) nil)))
+        exprs func lets)
     ;; Go through the expressions in reverse
     (dolist (line (reverse body))
       (cond ((not (listp line)) (push line exprs))
+            ((eq (car line) :let)
+             (push (cadr line) lets)
+             (push `(setq ,@(cdr line)) exprs))
             ((setq func (alist-get (car line) lens--let-keywords))
              (setq exprs `((,func (,(cdr line)) ,@exprs))))
             ((setq func (alist-get (car line) custom))
              (setq exprs (apply func exprs (cdr line))))
             (t (push line exprs))))
-    (if (> (length exprs) 1) (cons #'progn exprs) (car exprs))))
+    (cond (lets `(let ,lets ,@exprs))
+          ((> (length exprs) 1) (cons #'progn exprs))
+          (t (car exprs)))))
 
 
 ;;;; Utils
 
 (defmacro lens-save-position (&rest body)
   "Save the line and column of the cursor when executing BODY."
-  `(let* ((line (line-number-at-pos)) (col (current-column))
-          (ui-elem (lens--ui-element-at-point)))
+  `(let* ((line (line-number-at-pos)) (col (current-column)))
      ,@body
      (goto-char (point-min))
      (forward-line (1- line))
@@ -110,8 +119,8 @@ This allows for the following syntax:
 
 (defmacro lens-save-position-in-ui (&rest body)
   "Save the current position relative to the containing ui element."
-  `(let* ((line (line-number-at-pos)) (col (current-column))
-          me ui-key ui-line region)
+  `(let ((line (line-number-at-pos)) (col (current-column))
+         me ui-key ui-line region)
      (save-excursion
        (and
         ;; Find the prop match at the end of the component
@@ -128,7 +137,7 @@ This allows for the following syntax:
      (if (and ui-key (setq region (lens-at-point))
               (progn (goto-char (caddr region)) ; Go to the end of the lens header
                      ;; Go to the end of the key region
-                     (text-property-search-forward 'lens-element-key ui-key #'eq))
+                     (text-property-search-forward 'lens-element-key ui-key #'equal))
               ;; Go to the beginning of the key region
               (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
          (progn (forward-line ui-line)
@@ -385,6 +394,18 @@ the previous command, as described in `lens--field'."
            (horizontal   . "-")
            (vertical     . "|"))))
 
+(defun lens-string-width (str &optional start end)
+  "Calculate the width of STR in columns.
+
+The `string-width' function doesn't work correctly in certain situations
+for some reason. For example, it believes an em-dash has width 1."
+  (if start (string-width str start end)
+    (let ((inhibit-read-only t))
+      (if (boundp #'string-pixel-width)
+          (/ (string-pixel-width str) (string-pixel-width "a"))
+        (require 'shr)
+        (/ (shr-string-pixel-width str) (shr-string-pixel-width "a"))))))
+
 (defun lens-text-to-box (text &rest props)
   (pcase-let ((`(,body ,head ,foot) (apply #'lens--textbox-wrap text props)))
     (concat head
@@ -412,7 +433,7 @@ PROPS has the following meaningful properties:
    (:let width (or (plist-get props :width) 50))
    (when (plist-get props :shrink)
      (let ((longest-line (cl-loop for line in (split-string text "\n")
-                                  maximize (1+ (string-width line)))))
+                                  maximize (1+ (lens-string-width line)))))
        (setq width (min width (+ 2 (* hpad 2) longest-line)))))
 
    (:let inner-width (- width 2 (* 2 hpad)))
@@ -453,17 +474,17 @@ PROPS has the following meaningful properties:
    (:let cur-word-start nil)
 
    (:flet add-word (word &optional is-word)
-          (cond ((> (string-width word) inner-width)
+          (cond ((> (lens-string-width word) inner-width)
                  (when (string-empty-p (car body-lines)) (pop body-lines))
-                 (while (> (string-width word) inner-width)
-                   (let ((idx (cl-loop for i from 1 below (length word)
-                                       when (> (string-width word 0 i) inner-width)
+                 (while (> (lens-string-width word) inner-width)
+                   (let ((idx (cl-loop for i from 1 below (1+ (length word))
+                                       when (> (lens-string-width word 0 i) inner-width)
                                        do (cl-return (1- i))
                                        finally (cl-return (length word)))))
                      (push (substring word 0 idx) body-lines)
                      (setq word (substring word idx))))
                  (push word body-lines))
-                ((or (> (+ (string-width word) (string-width (car body-lines)) (if is-word 1 0))
+                ((or (> (+ (lens-string-width word) (lens-string-width (car body-lines)) (if is-word 1 0))
                         inner-width))
                  (when (string-empty-p (car body-lines)) (pop body-lines))
                  (push word body-lines))
@@ -514,7 +535,7 @@ PROPS has the following meaningful properties:
                              'front-sticky t
                              box-props)
                       (apply #'propertize
-                             (concat (make-string (+ (- inner-width (string-width it)) hpad) ?\s)
+                             (concat (make-string (+ (- inner-width (lens-string-width it)) hpad) ?\s)
                                      vert "\n")
                              box-props))
                 body-lines)
@@ -1161,7 +1182,7 @@ Create a ui context with the following properties:
     first time, or a subsequent time.
   :state - The internal state for the component being called. See
     `lens-ui-display'."
-  (let* ((state (if old-state (copy-tree old-state) (list :hooks nil :content nil)))
+  (let* ((state (or old-state (list :hooks nil :content nil)))
          (ctx (list :state state
                     :path path
                     :hook-idx 0
@@ -1171,23 +1192,23 @@ Create a ui context with the following properties:
          (output (let ((lens--current-ctx ctx))
                    (if (functionp elem)
                        (funcall elem ctx)
-                     (apply (get (car elem) 'lens-component) ctx (cddr elem)))))
-         (content
-          (if (stringp output) output
-            (--map (cons (if (keywordp (cadr it)) (cadr it)
-                           (error "First argument to component must be a keyword"))
-                         (lens--generate-ui
-                          it (append path (list (cadr it)))
-                          (when old-state (alist-get (cadr it) (plist-get old-state :content)))
-                          (if (numberp root-ctx-or-ui-id) ctx root-ctx-or-ui-id)))
-                   output))))
+                     (apply (get (car elem) 'lens-component) ctx (cddr elem))))))
+
+    (plist-put state :content
+               (if (stringp output) output
+                 (--map (cons (if (keywordp (cadr it)) (cadr it)
+                                (error "First argument to component must be a keyword"))
+                              (lens--generate-ui
+                               it (append path (list (cadr it)))
+                               (alist-get (cadr it) (plist-get state :content))
+                               (if (numberp root-ctx-or-ui-id) ctx root-ctx-or-ui-id)))
+                        output)))
 
     ;; Add root-specific properties
     (when (numberp root-ctx-or-ui-id)
       (plist-put ctx :active t)
       (plist-put ctx :ui-func elem))
 
-    (plist-put state :content content)
     (unless (functionp elem) (plist-put state :element elem))
 
     state))
@@ -1237,7 +1258,7 @@ Each callback takes a single argument, the state that they will mutate.")
 (defmacro lens-ui-callback (ctx &rest body)
   "Returns a callback function which performs BODY."
   `(lambda () (interactive)
-     (lens--ui-callback ctx (lambda () ,@body))))
+     (lens--ui-callback ,ctx (lambda () ,@body))))
 
 
 ;;;; Use state
@@ -1372,7 +1393,7 @@ with the following properties:
                                              ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
-          (cl-flet ((,set-var (cdr =use-state=)))
+          (cl-flet ((,set-var ,set-var))
             ,@body))))
      (:use-effect
       lambda (body dependencies effect)
@@ -1410,11 +1431,12 @@ with the following properties:
                         ,(cdr it))
                   props))))
 
-(lens-defcomponent box (_ctx text onchange &rest plist)
+(lens-defcomponent field (_ctx text onchange &rest plist)
   (lens--field text
                (lambda (new _cursor)
                  (funcall onchange new))
-               "[begin box]\n" "\n[end box]"))
+               (or (plist-get plist :header) "[begin box]\n")
+               (or (plist-get plist :footer) "\n[end box]")))
 
 (lens-defcomponent string (_ctx str)
   :can-be-column t
@@ -1448,14 +1470,6 @@ with the following properties:
 
 ;;;; Columns
 
-(defun lens-string-width (str)
-  "Calculate the pixel width of a string STR."
-  (let ((inhibit-read-only t))
-    (if (boundp #'string-pixel-width)
-        (/ (string-pixel-width str) (string-pixel-width "a"))
-      (require 'shr)
-      (/ (shr-string-pixel-width str) (shr-string-pixel-width "a")))))
-
 (defun lens--join-columns (cols &optional sep)
   "Vertically align a list of strings as columns.
 
@@ -1477,7 +1491,7 @@ string to insert between the columns."
                       (make-string (- max-w (lens-string-width cell-text)) ?\s)))))
     (string-join lines (propertize "\n" 'read-only t))))
 
-(lens-defcomponent columns (ctx &rest columns)
+(lens-defcomponent columns (_ctx &rest columns)
   ;; Ensure that all are valid columns
   (dolist (elem columns)
     (unless (get (car elem) 'lens-component-can-be-column)
@@ -1486,7 +1500,7 @@ string to insert between the columns."
   (:use-renderer ctx (lambda (cols) (lens--join-columns cols (propertize " " 'read-only t))))
   columns)
 
-(lens-defcomponent rows (ctx &rest rows)
+(lens-defcomponent rows (_ctx &rest rows)
   :can-be-column t
   rows)
 
@@ -1506,64 +1520,12 @@ string to insert between the columns."
 (defvar-local lens--focused-border-box nil
   "The focused border box in the current buffer, or nil.")
 
-(defun lens--border-box-fix-cursor ()
-  "When a box is active, this set as a local `post-command-hook'."
-  (when lens--focused-border-box
-    (-let (((&plist :last-point prev-pos :unique-id unique-id) lens--focused-border-box)
-           (cur-line (line-number-at-pos)))
-      (or (eq prev-pos (point))
-          (eq (get-text-property (point) 'lens-border-box-content) unique-id)
-          ;; Do not run if a modification was made
-          (memq #'lens--field-modification-callback (default-value 'post-command-hook))
-          ;; If we moved horizontally off of the line, go to the previous/next line
-          (if (eq cur-line (line-number-at-pos prev-pos))
-              (if (< (point) prev-pos)
-                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-                (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-                    ;; The cursor is allowed to be at the end of the last line
-                    (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
-            ;; If we moved to a different line, try to find the end of the line
-            (goto-char (pos-eol))
-            (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-                 ;; If we went off the end of the textbox
-                 (eq cur-line (line-number-at-pos))))
-          ;; If everything else failed, go back to the last known position
-          (progn (goto-char prev-pos)
-                 (message "Press ESC to exit the textbox")))
-      (plist-put lens--focused-border-box :last-point (point)))))
-
-(defun lens--border-box-callback (body line-idx new-line-text cursor-col)
-  (let ((new-content "")
-        deleted-bol new-cursor line)
-
-    (dotimes (i (length body))
-
-      ;; If the user deleted the BOL character, delete a character from the previous line
-      (setq deleted-bol (and (eq i line-idx)
-                             (not (get-text-property 0 'lens-border-box-bol new-line-text))))
-      (when (and deleted-bol (not (s-blank? new-content)))
-        (setq new-content (substring new-content 0 -1)))
-      (setq line (if (eq i line-idx)
-                     (substring new-line-text (if deleted-bol 0 1) -1)
-                   (car (nth i body))))
-
-      ;; Subtract 1 from the cursor col to account for the ~ prefix
-      (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
-                                               (if deleted-bol 0 -1))))
-
-      ;; Concat the line to the new content
-      (if (and (not (s-blank? line))
-               (get-text-property (1- (length line)) 'lens-textbox-newline line))
-          (setq new-content (concat new-content (substring line 0 -1) "\n"))
-        (setq new-content (concat new-content line))))
-
-    (cons new-content new-cursor)))
-
-(lens-defcomponent wrapped-box (ctx text set-text)
+(lens-defcomponent wrapped-box (ctx text set-text &optional onenter)
   :can-be-column t
 
   (:use-state cursor set-cursor nil)
-  (:use-state unique-id set-unique-id (abs (random)))
+  (:use-state unique-id _set-unique-id (abs (random)))
+  (setq cursor (when cursor (min cursor (length text))))
 
   (:let border-face 'shadow)
 
@@ -1584,8 +1546,13 @@ string to insert between the columns."
          (setq lens--focused-border-box nil)
          (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
   (:let map (if cursor
-                `(keymap (escape . ,(lens-ui-callback ctx (unfocus))))
+                `(keymap (escape . ,(lens-ui-callback ctx (unfocus)))
+                         (return . ,(when onenter (lambda () (interactive)
+                                                    (lens--ui-callback ctx onenter)))))
               `(keymap (return . ,(lens-ui-callback ctx (focus))))))
+
+  (when lens--focused-border-box
+    (plist-put lens--focused-border-box :unfocus (lens-ui-callback ctx (unfocus))))
 
   ;; Run the hooks when focus changes
   (:use-effect
@@ -1594,7 +1561,7 @@ string to insert between the columns."
 
   (:use-effect
    (list cursor-line cursor-col)
-   (lambda (start end)
+   (lambda (start _end)
      (when (and cursor-line cursor-col lens--focused-border-box)
        (goto-char start)
        (forward-line (1+ cursor-line))
@@ -1626,6 +1593,65 @@ string to insert between the columns."
            (list footer))
     (propertize "\n" 'read-only t))
    'keymap map))
+
+(defun lens--border-box-fix-cursor ()
+  "When a box is active, this set as a local `post-command-hook'."
+  (when lens--focused-border-box
+    (-let (((&plist :last-point prev-pos :unique-id unique-id) lens--focused-border-box)
+           (cur-line (line-number-at-pos)))
+      (or (eq prev-pos (point))
+          (eq (get-text-property (point) 'lens-border-box-content) unique-id)
+          ;; Do not run if a modification was made
+          (memq #'lens--field-modification-callback (default-value 'post-command-hook))
+          ;; If we moved horizontally off of the line, go to the previous/next line
+          (if (eq cur-line (line-number-at-pos prev-pos))
+              (if (< (point) prev-pos)
+                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+                (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+                    ;; The cursor is allowed to be at the end of the last line
+                    (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
+            ;; If we moved to a different line, try to find the end of the line
+            (goto-char (pos-eol))
+            (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+                 ;; If we went off the end of the textbox
+                 (eq cur-line (line-number-at-pos))))
+          ;; If everything else failed, go back to the last known position
+          (if (eq (or (get-text-property prev-pos 'lens-border-box-content)
+                      (get-text-property prev-pos 'lens-border-box-eol))
+                  unique-id)
+              (progn (goto-char prev-pos)
+                     (message "Press ESC to exit the textbox"))
+            (funcall (plist-get lens--focused-border-box :unfocus))))
+
+      (when lens--focused-border-box
+        (plist-put lens--focused-border-box :last-point (point))))))
+
+(defun lens--border-box-callback (body line-idx new-line-text cursor-col)
+  (let ((new-content "")
+        deleted-bol new-cursor line)
+
+    (dotimes (i (length body))
+
+      ;; If the user deleted the BOL character, delete a character from the previous line
+      (setq deleted-bol (and (eq i line-idx)
+                             (not (get-text-property 0 'lens-border-box-bol new-line-text))))
+      (when (and deleted-bol (not (s-blank? new-content)))
+        (setq new-content (substring new-content 0 -1)))
+      (setq line (if (eq i line-idx)
+                     (substring new-line-text (if deleted-bol 0 1) -1)
+                   (car (nth i body))))
+
+      ;; Subtract 1 from the cursor col to account for the ~ prefix
+      (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
+                                               (if deleted-bol 0 -1))))
+
+      ;; Concat the line to the new content
+      (if (and (not (s-blank? line))
+               (get-text-property (1- (length line)) 'lens-textbox-newline line))
+          (setq new-content (concat new-content (substring line 0 -1) "\n"))
+        (setq new-content (concat new-content line))))
+
+    (cons new-content new-cursor)))
 
 
 ;;; Usable functions
