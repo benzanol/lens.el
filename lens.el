@@ -430,11 +430,13 @@ PROPS has the following meaningful properties:
   :box-props - Plist of text properties applied only to the border"
   (lens-let-body
    (:let hpad (or (plist-get props :pad) 1))
+   (:let title (plist-get props :title))
    (:let width (or (plist-get props :width) 50))
    (when (plist-get props :shrink)
      (let ((longest-line (cl-loop for line in (split-string text "\n")
                                   maximize (1+ (lens-string-width line)))))
-       (setq width (min width (+ 2 (* hpad 2) longest-line)))))
+       (setq width (min width (max (+ 2 (* hpad 2) longest-line)
+                                   (if title (+ 6 (length title)) 0))))))
 
    (:let inner-width (- width 2 (* 2 hpad)))
    (unless (> inner-width 0) (error "Text box is too thin"))
@@ -445,7 +447,6 @@ PROPS has the following meaningful properties:
    (:let chars (alist-get (or (plist-get props :charset) 'ascii)
                           lens-textbox-chars))
 
-   (:let title (plist-get props :title))
    ;; 3 chars are needed before the title, 3 after the title
    (:let show-title-len (min (- width 6) (length title)))
    (:let show-title (and title (> show-title-len 0)
@@ -694,8 +695,10 @@ value, rather than a new state value. In this case, don't call
 the update function (the new text is already saved).
 
 If NOREFRESH is t, only the header and footer should be reinserted. If
-NOREFRESH is a (lambda (OLDSTATE NEWSTATE HE FB)), then use that function to
-reinsert the lens content."
+NOREFRESH is a (lambda (OLDSTATE NEWSTATE HE FB)), then use that
+function to reinsert the lens content. If NOREFRESH is :refresh, always
+refresh, even if nothing has changed."
+
   (pcase-let* ((`((,spec ,oldtext ,oldstate) ,hb ,he ,fb ,fe) region)
                (display (get spec :display))
                (source (get spec :source))
@@ -709,13 +712,15 @@ reinsert the lens content."
     ;; If nothing was changed, then leave the current lens as is.
     ;; Replacing the lens when it hasn't changed can lead to issues
     ;; with the undo history
-    (unless (and (string= oldtext newtext) (equal oldstate newstate))
+    (unless (and (not (eq norefresh :refresh))
+                 (string= oldtext newtext)
+                 (equal oldstate newstate))
       (lens-silent-edit
        ;; Refresh the style properties
        (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
        (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
 
-       (if norefresh
+       (if (or (eq norefresh t) (functionp norefresh))
            ;; Reinsert only the header and footer
            (let ((strs (lens--generate-headers newlens)))
              (save-excursion (goto-char fb) (delete-region fb fe) (insert (cdr strs))
@@ -966,7 +971,7 @@ hance _AFTER-CHANGE-ARGS, although the args are ignored."
 
 TEXT is the new text of the field."
   (let ((region (lens-at-point)))
-    (lens-modify region text nil :norefresh)))
+    (lens-modify region text nil t)))
 
 (defun lens--raw-display-insert (state)
   "Generate the content for a raw display with state STATE."
@@ -1078,7 +1083,7 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
         edits)))))
 
 
-;;;; Rerenderer
+;;;; Rendering
 
 (defun lens--ui-state-to-string (state)
   (cl-loop for ((keys) . string) in (lens--ui-string-rows state nil)
@@ -1161,68 +1166,63 @@ This format is designed to be suitable for diffing, as used in
 
 (defvar lens--current-ctx nil)
 
-(defun lens--generate-ui (elem path old-state root-ctx-or-ui-id)
-  "Return the new state for the component.
+(defun lens--generate-ui (elem path old-state root-state)
+  "Generate the UI for a component.
 
-ELEM is either (ELEM KEY ARGS...) or a function.
+ELEM is either (ELEM KEY ARGS...) or a ui function.
 
 PATH is a list of keywords, the keys of each of the parent elements. For
 the root element, this will be nil.
 
-OLD-STATE is the previous ui state, or nil if this is the first time
-generating the ui.
+OLD-STATE is the previous state for this component (which will be
+mutated), or nil if this is the first time generating the component.
 
-When this is the root context, ROOT-CTX-OR-UI-ID is the ui id, otherwise
-it is the pointer to the root context. The root context is the only
-context that has the :active, :ui-id, and :ui-func properties, all other
-contexts must get this information from the root context.
+ROOT-STATE is the root state for the ui, or nil if this is the root
+component, and it is the first time generating the root component.
 
-Create a ui context with the following properties:
+Returns a ui context with the following properties:
+  :state - The internal state for the component being called
+  :root-state - The root state for the ui
   :is-first-call - Indicates whether calling a UI component for the
     first time, or a subsequent time.
-  :state - The internal state for the component being called. See
-    `lens-ui-display'."
+  :path - The key path to the current level
+  :hook-idx - How many hooks have been processed in the current level
+
+The only property that really matters for the return is :state, which
+might be new."
   (let* ((state (or old-state (list :hooks nil :content nil)))
          (ctx (list :state state
+                    :root-state (or root-state state)
                     :path path
                     :hook-idx 0
-                    :is-first-call (null old-state)
-                    (if (numberp root-ctx-or-ui-id) :ui-id :root-ctx) root-ctx-or-ui-id))
+                    :is-first-call (null old-state)))
          ;; Perform the actual function
          (output (let ((lens--current-ctx ctx))
                    (if (functionp elem)
                        (funcall elem ctx)
-                     (apply (get (car elem) 'lens-component) ctx (cddr elem))))))
+                     (apply (get (car elem) 'lens-component) ctx (cddr elem)))))
+         (old-children (unless (stringp (plist-get old-state :content)) (plist-get old-state :content))))
 
     (plist-put state :content
                (if (stringp output) output
                  (--map (cons (if (keywordp (cadr it)) (cadr it)
                                 (error "First argument to component must be a keyword"))
-                              (lens--generate-ui
-                               it (append path (list (cadr it)))
-                               (alist-get (cadr it) (plist-get state :content))
-                               (if (numberp root-ctx-or-ui-id) ctx root-ctx-or-ui-id)))
+                              (plist-get
+                               (lens--generate-ui
+                                it (append path (list (cadr it)))
+                                (alist-get (cadr it) old-children)
+                                (plist-get ctx :root-state))
+                               :state))
                         output)))
 
-    ;; Add root-specific properties
-    (when (numberp root-ctx-or-ui-id)
-      (plist-put ctx :active t)
-      (plist-put ctx :ui-func elem))
-
-    (unless (functionp elem) (plist-put state :element elem))
-
-    state))
+    (plist-put state :element (unless (functionp elem) elem))
+    ctx))
 
 
-;;;; Callback
+;;;; Use callback
 
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
-
-(defvar lens--ui-callbacks nil
-  "An alist mapping a ui-id to a list of callbacks.
-
-Each callback takes a single argument, the state that they will mutate.")
 
 (defun lens--follow-key-path (state path)
   (if (null path) state
@@ -1231,34 +1231,60 @@ Each callback takes a single argument, the state that they will mutate.")
          (error "Invalid component key path"))
      (cdr path))))
 
-(defun lens--ui-callback (ctx run)
-  (lens-let-body
-   (:let root-ctx (or (plist-get ctx :root-ctx) ctx))
-   (unless (plist-get root-ctx :active) (error "Context is no longer active"))
-   ;; (plist-put root-ctx :active nil)
+(defun lens--perform-callback (state path name)
+  "Perform a named callback.
 
-   (:let region (lens-at-point))
-   (:let ui-id (plist-get root-ctx :ui-id))
-   (unless (eq ui-id (plist-get (caddr (car region)) :ui-id))
-     (error "Incorrect ui at point"))
+STATE is the root ui state. PATH is the path to the component containing
+the callback. NAME is the name of the callback."
+  (with-current-buffer (plist-get state :buffer)
+    (lens-save-position-in-ui
+     (goto-char (point-min))
 
-   (:let old-state (caddr (car region)))
-   (:let lens--callback-state (copy-tree old-state))
+     (or (text-property-search-forward
+          'lens-begin state
+          #'(lambda (st lens) (eq st (car (caddr lens)))))
+         (error "Lens not found"))
 
-   ;; Apply the mutations
-   (funcall run)
+     (let* ((region (lens-at-point))
+            (lens-state (caddr (car region)))
+            (lens-ui-state (car lens-state))
+            (_ (cl-assert (eq lens-ui-state state)))
+            (nested-state (lens--follow-key-path state path))
+            (hook (or (--find (and (eq (car it) :use-callback)
+                                   (eq (cadr it) name))
+                              (plist-get nested-state :hooks))
+                      (error "Callback not found %s %s" path name)))
 
-   ;; Generate the ui for the new state
-   (:let new-state (lens--generate-ui (plist-get root-ctx :ui-func) nil
-                                      lens--callback-state ui-id))
+            (lens--callback-state state))
 
-   ;; Apply the new state
-   (lens-modify region new-state nil #'lens--ui-renderer)))
+       (funcall (caddr hook))
 
-(defmacro lens-ui-callback (ctx &rest body)
-  "Returns a callback function which performs BODY."
-  `(lambda () (interactive)
-     (lens--ui-callback ,ctx (lambda () ,@body))))
+       (lens--generate-ui (plist-get state :ui-func) nil
+                          state state)
+
+       (lens-modify region (cons state nil) nil :refresh)))))
+
+(defun lens--use-callback (ctx name cb)
+  (let* ((state (plist-get ctx :state))
+         (hooks (plist-get state :hooks))
+         (hook-idx (plist-get ctx :hook-idx))
+         (path (plist-get ctx :path))
+         (root-state (plist-get ctx :root-state))
+         hook)
+
+    (if (plist-get ctx :is-first-call)
+        ;; Add a hook to the hooks list
+        (progn (cl-assert (eq (length hooks) hook-idx))
+               (setq hook (list :use-callback name cb))
+               (plist-put state :hooks (nconc hooks (list hook))))
+      ;; Check if the indexed hook is a use-callback hook
+      (setq hook (nth hook-idx hooks))
+      (unless hook (error "Called :use-callback hook where no hook was previously"))
+      (unless (eq (car hook) :use-callback) (error "Called :use-callback hook where %s hook was previously" (car hook)))
+      (setf (caddr hook) cb))
+
+    (plist-put ctx :hook-idx (1+ hook-idx))
+    `(lambda () (lens--perform-callback ',root-state ',path ',name))))
 
 
 ;;;; Use state
@@ -1353,32 +1379,54 @@ dependencies changed since the last render."
 UI is a function which takes a ui context and returns a list of
 components.
 
-The state for a particular component in the component tree is a plist
-with the following properties:
+Each component has \"component state,\" which is a plist with the
+following properties:
   :hooks - A list of hooks called in the component, in order. Each call
     must have the same hooks and order. Each hook has the
     format (HOOK-KEYWORD ARGS...).
-  :content - An alist from keys to child elements, or a string
+  :content - An alist from keys to child component states, or a string
+  :renderer? - When :content is an alist, this is a function which takes
+    the insert strings of each of the child components, and returns the
+    insert string of the current component.
 
-The state for the display is the state for the root component, along
-with the following properties:
-  :text - The underlying text representation of the current state. The
-    text can be changed by using the :use-text hook.
-  :ui - A list of tuples (ELEM STRING KEY), which is the list of
-    elements returned by the root element."
+The \"ui state\" is the state for the root component, along with the
+following properties:
+  :original-text - The original input text that the ui was created with
+  :ui-id - Unique id for this ui
+
+The display state is a cons cell, (UI-STATE . LOCAL-STATE). The way that
+lenses work, is that the state of each version of a lens must be a
+different object, so that we can move through the history. It would be
+costly to store an entire copy of the entire ui state for every time
+stamp. Thus, the UI-STATE is mutated, and its value shared between all
+versions of the lens, whereas LOCAL-STATE store the time-dependenet
+aspects of the lens which are copied for every version.
+
+Specifically, LOCAL-STATE is an alist of path symbols to the state
+values. If you have a call (:use-local-state count set-count 10) in the
+component (:root :column), then the alist would look like
+
+((:root:column:0 . 10))
+
+where :root:column:count is a single symbol. The path symbol is equal to
+the child keys concatenated with the index of the :use-local-state
+hook among all hooks in the current component."
 
   (let ((ui-id (abs (random))))
     (list :tostate
           (lambda (text)
-            (let ((state (lens--generate-ui ui-func nil nil ui-id)))
-              (plist-put state :text text)
+            (let* ((ctx (lens--generate-ui ui-func nil nil nil))
+                   (state (plist-get ctx :state)))
+              (plist-put state :original-text text)
               (plist-put state :ui-id ui-id)
-              state))
+              (plist-put state :buffer (current-buffer))
+              (plist-put state :ui-func ui-func)
+              (cons state nil)))
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
             (concat (propertize "\n" 'lens-element-key 'START)
-                    (lens--ui-state-to-string state))))))
+                    (lens--ui-state-to-string (car state)))))))
 
 
 ;;;; Defui
@@ -1395,6 +1443,11 @@ with the following properties:
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
             ,@body))))
+     (:use-callback
+      lambda (body name callback)
+      `((let ((,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
+                                         ',name ,callback)))
+          ,@body)))
      (:use-effect
       lambda (body dependencies effect)
       `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
@@ -1462,8 +1515,7 @@ with the following properties:
 (lens-defcomponent button (ctx label onclick &key face)
   :can-be-column t
   (propertize (format " %s " label)
-              'lens-click
-              (when onclick (lambda () (lens--ui-callback ctx onclick)))
+              'lens-click onclick
               'keymap lens-button-map
               'face (or face 'lens-button)
               'font-lock-face (or face 'lens-button)
