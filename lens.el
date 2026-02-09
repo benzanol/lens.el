@@ -696,8 +696,7 @@ the update function (the new text is already saved).
 
 If NOREFRESH is t, only the header and footer should be reinserted. If
 NOREFRESH is a (lambda (OLDSTATE NEWSTATE HE FB)), then use that
-function to reinsert the lens content. If NOREFRESH is :refresh, always
-refresh, even if nothing has changed."
+function to reinsert the lens content."
 
   (pcase-let* ((`((,spec ,oldtext ,oldstate) ,hb ,he ,fb ,fe) region)
                (display (get spec :display))
@@ -712,7 +711,7 @@ refresh, even if nothing has changed."
     ;; If nothing was changed, then leave the current lens as is.
     ;; Replacing the lens when it hasn't changed can lead to issues
     ;; with the undo history
-    (unless (and (not (eq norefresh :refresh))
+    (unless (and (not (functionp norefresh))
                  (string= oldtext newtext)
                  (equal oldstate newstate))
       (lens-silent-edit
@@ -720,7 +719,7 @@ refresh, even if nothing has changed."
        (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
        (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
 
-       (if (or (eq norefresh t) (functionp norefresh))
+       (if norefresh
            ;; Reinsert only the header and footer
            (let ((strs (lens--generate-headers newlens)))
              (save-excursion (goto-char fb) (delete-region fb fe) (insert (cdr strs))
@@ -728,7 +727,7 @@ refresh, even if nothing has changed."
              (save-excursion (goto-char hb) (delete-region hb he) (insert (car strs))
                              (lens--refresh-buffer hb (point)))
              (when (functionp norefresh)
-               (funcall norefresh oldstate newstate he fb)))
+               (funcall norefresh he fb)))
 
          ;; Reinsert the entire lens
          (let ((insert (lens--generate-insert-text newlens)))
@@ -1114,9 +1113,8 @@ This format is designed to be suitable for diffing, as used in
       (--mapcat (lens--ui-string-rows (cdr it) (append key-path (list (car it))))
                 content))))
 
-(defun lens--ui-renderer (old-state new-state he fb)
-  (let* ((old-rows (lens--ui-string-rows old-state nil))
-         (new-rows (lens--ui-string-rows new-state nil))
+(defun lens--ui-renderer (state old-rows he fb)
+  (let* ((new-rows (lens--ui-string-rows state nil))
          (diff (lens--ui-diff old-rows new-rows))
          ;; Keep a hash map from key paths to (start . end) positions
          (key-path-to-posns (make-hash-table :test #'equal :size (* 2 (length new-rows))))
@@ -1159,7 +1157,7 @@ This format is designed to be suitable for diffing, as used in
            (setq last-key-path key-path)))))
 
     ;; Run any use effect callbacks
-    (lens--ui-run-effects new-state key-path-to-posns)))
+    (lens--ui-run-effects state key-path-to-posns)))
 
 
 ;;;; Generating uis
@@ -1236,33 +1234,45 @@ might be new."
 
 STATE is the root ui state. PATH is the path to the component containing
 the callback. NAME is the name of the callback."
-  (with-current-buffer (plist-get state :buffer)
-    (lens-save-position-in-ui
-     (goto-char (point-min))
 
-     (or (text-property-search-forward
-          'lens-begin state
-          #'(lambda (st lens) (eq st (car (caddr lens)))))
-         (error "Lens not found"))
+  ;; Find the correct function to call
+  (let* ((nested-state (lens--follow-key-path state path))
+         (hook (or (--find (and (eq (car it) :use-callback)
+                                (eq (cadr it) name))
+                           (plist-get nested-state :hooks))
+                   (error "Callback not found %s %s" path name))))
 
-     (let* ((region (lens-at-point))
-            (lens-state (caddr (car region)))
-            (lens-ui-state (car lens-state))
-            (_ (cl-assert (eq lens-ui-state state)))
-            (nested-state (lens--follow-key-path state path))
-            (hook (or (--find (and (eq (car it) :use-callback)
-                                   (eq (cadr it) name))
-                              (plist-get nested-state :hooks))
-                      (error "Callback not found %s %s" path name)))
+    ;; If this is a callback called from within another callback
+    (if lens--callback-state
+        (funcall (caddr hook))
 
-            (lens--callback-state state))
+      ;; This is the root-level callback, so we need to handle updating the lens
+      (with-current-buffer (plist-get state :buffer)
+        (lens-save-position-in-ui
+         (goto-char (point-min))
 
-       (funcall (caddr hook))
+         (or (text-property-search-forward
+              'lens-begin state
+              #'(lambda (st lens) (eq st (car (caddr lens)))))
+             (error "Lens not found"))
 
-       (lens--generate-ui (plist-get state :ui-func) nil
-                          state state)
+         (let ((region (lens-at-point))
+               (old-rows (lens--ui-string-rows state nil)))
 
-       (lens-modify region (cons state nil) nil :refresh)))))
+           ;; Since we specifically searched for a lens with the correct state,
+           ;; this should never be an issue, but check just in case
+           (unless (eq (car (caddr (car region))) state)
+             (error "Lens at point is for the incorrect state"))
+
+           (let ((lens--callback-state state))
+             (funcall (caddr hook)))
+
+           (lens--generate-ui (plist-get state :ui-func) nil
+                              state state)
+
+           (lens-modify region (cons state nil) nil
+                        (lambda (he fb)
+                          (lens--ui-renderer state old-rows he fb)))))))))
 
 (defun lens--use-callback (ctx name cb)
   (let* ((state (plist-get ctx :state))
@@ -1406,7 +1416,7 @@ Specifically, LOCAL-STATE is an alist of path symbols to the state
 values. If you have a call (:use-local-state count set-count 10) in the
 component (:root :column), then the alist would look like
 
-((:root:column:0 . 10))
+\((:root:column:0 . 10))
 
 where :root:column:count is a single symbol. The path symbol is equal to
 the child keys concatenated with the index of the :use-local-state
