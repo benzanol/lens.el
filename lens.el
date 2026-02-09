@@ -1201,12 +1201,16 @@ might be new."
                    (if (functionp elem)
                        (funcall elem ctx)
                      (apply (get (car elem) 'lens-component) ctx (cddr elem)))))
-         (old-children (unless (stringp (plist-get old-state :content)) (plist-get old-state :content))))
+         (old-children (unless (stringp (plist-get old-state :content)) (plist-get old-state :content)))
+         child-keys)
 
     (plist-put state :content
                (if (stringp output) output
-                 (--map (cons (if (keywordp (cadr it)) (cadr it)
-                                (error "First argument to component must be a keyword"))
+                 (--map (cons (cond ((not (keywordp (cadr it)))
+                                     (error "First argument to component must be a keyword"))
+                                    ((memq (cadr it) child-keys)
+                                     (error "Duplicate child key: %s" (cadr it)))
+                                    (t (car (push (cadr it) child-keys))))
                               (plist-get
                                (lens--generate-ui
                                 it (append path (list (cadr it)))
@@ -1585,7 +1589,18 @@ string to insert between the columns."
   rows)
 
 
-;;;; Border text box
+;;;; Text field
+
+(lens-defcomponent text-field (_ctx text set-text &key header footer)
+  (:use-callback onchange (newtext _newcursor)
+                 (funcall set-text newtext))
+
+  (lens--field text onchange
+               (propertize (or header "[begin field]\n") 'face 'lens-field-header)
+               (propertize (or footer "\n[end field]") 'face 'lens-field-header)))
+
+
+;;;; Text box
 
 (defcustom lens-box-enter-hook nil
   "Hook run after entering a box."
