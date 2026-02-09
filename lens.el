@@ -1319,13 +1319,21 @@ the callback. NAME is the name of the callback."
         (unless (eq (car (caddr (car region))) state)
           (error "Lens at point is for the incorrect state"))
 
+        ;; Update the actual state based on the buffer state
+        (when (lens--propogate-buffer-state state (cdr (caddr (car region))))
+          (message "Detected buffer state change, pre-regenerating ui!")
+          (lens--generate-ui (plist-get state :ui-func) nil
+                             state state))
+
         (let ((lens--callback-state state))
           (apply (caddr hook) args))
 
         (lens--generate-ui (plist-get state :ui-func) nil
                            state state)
 
-        (lens-modify region (cons state nil) nil
+        (lens-modify region
+                     (cons state (lens--collect-buffer-states state nil))
+                     nil
                      (lambda (he fb)
                        (lens--ui-renderer state old-rows he fb)))))))
 
@@ -1346,6 +1354,45 @@ the callback. NAME is the name of the callback."
          (hook (lens--register-hook ctx :use-state initial))
          (value (cadr hook)))
     (cons value (lambda (value) (lens--use-state-callback path hook-idx value)))))
+
+
+;;;; Use buffer state
+
+(defun lens--collect-buffer-states (state path)
+  (nconc (cl-loop for hook in (plist-get state :hooks)
+                  for hook-idx from 0
+                  when (eq (car hook) :use-buffer-state)
+                  collect (list path hook-idx (copy-tree (cadr hook))))
+         (when (listp (plist-get state :content))
+           (cl-loop for (key . child) in (plist-get state :content)
+                    nconc (lens--collect-buffer-states child (append path (list key)))))))
+
+(defun lens--propogate-buffer-state (state buffer-states)
+  (let ((any-changed nil))
+    (pcase-dolist (`(,path ,hook-idx ,value) buffer-states)
+      (when-let ((nested-state (lens--follow-key-path state path)))
+        (let ((hook (nth hook-idx (plist-get nested-state :hooks))))
+          (or (eq :use-buffer-state (car hook))
+              (error "Misplaced buffer state hook: %s %s" path hook-idx))
+          (unless (equal value (cadr hook))
+            (setf (cadr hook) value)
+            (setq any-changed t)))))
+    any-changed))
+
+(defun lens--use-buffer-state-callback (path hook-idx value)
+  (let* ((root-state (or lens--callback-state
+                         (error "Called set-buffer-state outside of a ui callback")))
+         (nested-state (lens--follow-key-path root-state path))
+         (hooks (plist-get nested-state :hooks))
+         (hook (nth hook-idx hooks)))
+    (setf (cadr hook) value)))
+
+(defun lens--use-buffer-state (ctx initial)
+  (let* ((hook-idx (plist-get ctx :hook-idx))
+         (path (plist-get ctx :path))
+         (hook (lens--register-hook ctx :use-buffer-state initial))
+         (value (cadr hook)))
+    (cons value (lambda (value) (lens--use-buffer-state-callback path hook-idx value)))))
 
 
 ;;;; Use effect
@@ -1436,7 +1483,8 @@ hook among all hooks in the current component."
                            :ui-id ui-id
                            :buffer (current-buffer)
                            :ui-func ui-func)))
-              (cons (lens--generate-ui ui-func nil nil state) nil)))
+              (cons (lens--generate-ui ui-func nil nil state)
+                    (lens--collect-buffer-states state nil))))
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
@@ -1454,6 +1502,14 @@ hook among all hooks in the current component."
       lambda (body state-var set-var initial)
       `((let* ((=use-state= (lens--use-state (or lens--current-ctx (error "No containing lens context"))
                                              ,initial))
+               (,state-var (car =use-state=))
+               (,set-var (cdr =use-state=)))
+          (cl-flet ((,set-var ,set-var))
+            ,@body))))
+     (:use-buffer-state
+      lambda (body state-var set-var initial)
+      `((let* ((=use-state= (lens--use-buffer-state (or lens--current-ctx (error "No containing lens context"))
+                                                    ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
