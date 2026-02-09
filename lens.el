@@ -1222,10 +1222,59 @@ Creates an intermediate ui-generation context which is a plist containing:
     (plist-put state :element (unless (functionp elem) elem))))
 
 
+;;;; Hook helper macro
+
+(defmacro lens--register-hook (ctx type &rest args)
+  (declare (indent 2))
+  `(let* ((state (plist-get ctx :state))
+          (hooks (plist-get state :hooks))
+          (hook-idx (plist-get ctx :hook-idx))
+          hook)
+
+     (if (plist-get ,ctx :is-first-call)
+         ;; Add a hook to the hooks list
+         (progn (cl-assert (eq (length hooks) hook-idx))
+                (setq hook (list ,type ,@args))
+                (plist-put state :hooks (nconc hooks (list hook))))
+       ;; Check if the indexed hook has the correct type
+       (setq hook (nth hook-idx hooks))
+       (unless hook (error "Called %s hook where no hook was previously" ,type))
+       (unless (eq (car hook) ,type)
+         (error "Called %s hook where %s hook was previously" ,type (car hook))))
+     (plist-put ctx :hook-idx (1+ hook-idx))
+     hook))
+
+
 ;;;; Use callback
 
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
+
+(defun lens--use-callback (ctx name cb)
+  "Register a :use-callback hook.
+
+\(:use-callback NAME CALLBACK SYMBOL)
+
+Where SYMBOL is a custom symbol whose function value is set to call this
+hook. This function returns SYMBOL."
+
+  (let* ((root-state (plist-get ctx :root-state))
+         (ui-id (plist-get root-state :ui-id))
+         (path (plist-get ctx :path))
+         (hook
+          (lens--register-hook ctx :use-callback
+            name cb
+            (let* ((str (cl-loop for sym in path
+                                 concat (symbol-name sym) into str
+                                 finally return (format "$%s@%s%s" name ui-id str)))
+                   (ret-symbol (make-symbol str)))
+              (fset ret-symbol
+                    `(lambda (&rest args)
+                       (interactive)
+                       (lens--perform-callback ',root-state ',path ',name args)))
+              ret-symbol))))
+    (setf (caddr hook) cb)
+    (nth 3 hook)))
 
 (defun lens--follow-key-path (state path)
   (if (null path) state
@@ -1280,46 +1329,6 @@ the callback. NAME is the name of the callback."
                      (lambda (he fb)
                        (lens--ui-renderer state old-rows he fb)))))))
 
-(defun lens--use-callback (ctx name cb)
-  "Register a :use-callback hook.
-
-The hook is stored with the format
-
-\(:use-callback NAME CALLBACK COMMAND)
-
-This function returns COMMAND."
-
-  (let* ((state (plist-get ctx :state))
-         (hooks (plist-get state :hooks))
-         (hook-idx (plist-get ctx :hook-idx))
-         (path (plist-get ctx :path))
-         (root-state (plist-get ctx :root-state))
-         (ui-id (plist-get root-state :ui-id))
-         hook sym-name ret-symbol)
-
-    (if (plist-get ctx :is-first-call)
-        ;; Add a hook to the hooks list
-        (progn (cl-assert (eq (length hooks) hook-idx))
-               (setq sym-name (cl-loop for sym in path
-                                       concat (symbol-name sym) into str
-                                       finally return (format "$%s@%s%s" name ui-id str)))
-               (setq ret-symbol (make-symbol sym-name))
-               (fset ret-symbol
-                     `(lambda (&rest args)
-                        (interactive)
-                        (lens--perform-callback ',root-state ',path ',name args)))
-               (setq hook (list :use-callback name cb ret-symbol))
-               (plist-put state :hooks (nconc hooks (list hook))))
-
-      ;; Check if the indexed hook is a use-callback hook
-      (setq hook (nth hook-idx hooks))
-      (unless hook (error "Called :use-callback hook where no hook was previously"))
-      (unless (eq (car hook) :use-callback) (error "Called :use-callback hook where %s hook was previously" (car hook)))
-      (setf (caddr hook) cb))
-
-    (plist-put ctx :hook-idx (1+ hook-idx))
-    (nth 3 hook)))
-
 
 ;;;; Use state
 
@@ -1332,25 +1341,11 @@ This function returns COMMAND."
     (setf (cadr hook) value)))
 
 (defun lens--use-state (ctx initial)
-  (let* ((state (plist-get ctx :state))
-         (hooks (plist-get state :hooks))
-         (hook-idx (plist-get ctx :hook-idx))
+  (let* ((hook-idx (plist-get ctx :hook-idx))
          (path (plist-get ctx :path))
-         hook)
-
-    (if (plist-get ctx :is-first-call)
-        ;; Add a hook to the hooks list
-        (progn (cl-assert (eq (length hooks) hook-idx))
-               (setq hook (list :use-state initial))
-               (plist-put state :hooks (nconc hooks (list hook))))
-      ;; Check if the indexed hook is a use-state hook
-      (setq hook (nth hook-idx hooks))
-      (unless hook (error "Called :use-state hook where no hook was previously"))
-      (unless (eq (car hook) :use-state) (error "Called :use-state hook where %s hook was previously" (car hook))))
-
-    (plist-put ctx :hook-idx (1+ hook-idx))
-    (cons (cadr hook)
-          (lambda (value) (lens--use-state-callback path hook-idx value)))))
+         (hook (lens--register-hook ctx :use-state initial))
+         (value (cadr hook)))
+    (cons value (lambda (value) (lens--use-state-callback path hook-idx value)))))
 
 
 ;;;; Use effect
@@ -1380,29 +1375,16 @@ this particular render.
 
 The 3rd parameter is t if this is the first render, or if the
 dependencies changed since the last render."
-  (let* ((state (plist-get ctx :state))
-         (hooks (plist-get state :hooks))
-         (hook-idx (plist-get ctx :hook-idx))
-         hook)
+  (let* ((hook (lens--register-hook ctx :use-effect
+                 effect dependencies t)))
 
-    (if (plist-get ctx :is-first-call)
-        ;; Add a hook to the hooks list
-        (progn (cl-assert (eq (length hooks) hook-idx))
-               (setq hook (list :use-effect effect dependencies t))
-               (plist-put state :hooks (nconc hooks (list hook))))
-      ;; Check if the indexed hook is a use-effect hook
-      (setq hook (nth hook-idx hooks))
-      (unless hook (error "Called use-effect hook where no hook was previously"))
-      (unless (eq (car hook) :use-effect) (error "Called use-effect hook where %s hook was previously" (car hook)))
-      ;; Set the callback to the new callback
-      (setf (cadr hook) effect)
-      ;; Check if the dependencies have changed
-      (if (equal dependencies (caddr hook))
-          (setf (nth 3 hook) nil)
-        (setf (nth 2 hook) dependencies)
-        (setf (nth 3 hook) t)))
-
-    (plist-put ctx :hook-idx (1+ hook-idx))))
+    ;; Set the callback to the new callback
+    (setf (cadr hook) effect)
+    ;; Check if the dependencies have changed
+    (if (equal dependencies (caddr hook))
+        (setf (nth 3 hook) nil)
+      (setf (caddr hook) dependencies)
+      (setf (nth 3 hook) t))))
 
 
 ;;;; Ui display
