@@ -1190,7 +1190,8 @@ Returns a ui context with the following properties:
 
 The only property that really matters for the return is :state, which
 might be new."
-  (let* ((state (or old-state (list :hooks nil :content nil)))
+  (let* ((state (or old-state (and (null path) root-state)
+                    (list :hooks nil :content nil)))
          (ctx (list :state state
                     :root-state (or root-state state)
                     :path path
@@ -1295,15 +1296,21 @@ This function returns COMMAND."
          (hook-idx (plist-get ctx :hook-idx))
          (path (plist-get ctx :path))
          (root-state (plist-get ctx :root-state))
-         hook)
+         (ui-id (plist-get root-state :ui-id))
+         hook sym-name ret-symbol)
 
     (if (plist-get ctx :is-first-call)
         ;; Add a hook to the hooks list
         (progn (cl-assert (eq (length hooks) hook-idx))
-               (setq hook (list :use-callback name cb
-                                `(lambda (&rest args)
-                                   (interactive)
-                                   (lens--perform-callback ',root-state ',path ',name args))))
+               (setq sym-name (cl-loop for sym in path
+                                       concat (symbol-name sym) into str
+                                       finally return (format "$%s@%s%s" name ui-id str)))
+               (setq ret-symbol (make-symbol sym-name))
+               (fset ret-symbol
+                     `(lambda (&rest args)
+                        (interactive)
+                        (lens--perform-callback ',root-state ',path ',name args)))
+               (setq hook (list :use-callback name cb ret-symbol))
                (plist-put state :hooks (nconc hooks (list hook))))
 
       ;; Check if the indexed hook is a use-callback hook
@@ -1444,12 +1451,12 @@ hook among all hooks in the current component."
   (let ((ui-id (abs (random))))
     (list :tostate
           (lambda (text)
-            (let* ((ctx (lens--generate-ui ui-func nil nil nil))
-                   (state (plist-get ctx :state)))
-              (plist-put state :original-text text)
-              (plist-put state :ui-id ui-id)
-              (plist-put state :buffer (current-buffer))
-              (plist-put state :ui-func ui-func)
+            (let* ((state (list
+                           :original-text text
+                           :ui-id ui-id
+                           :buffer (current-buffer)
+                           :ui-func ui-func)))
+              (lens--generate-ui ui-func nil nil state)
               (cons state nil)))
           :totext (lambda (state) (plist-get state :text))
           :insert
@@ -1473,11 +1480,11 @@ hook among all hooks in the current component."
           (cl-flet ((,set-var ,set-var))
             ,@body))))
      (:use-callback
-      lambda (body name &rest callback)
-      `((let* ((cb ,(if (eq (length callback) 1) (car callback) (cons #'lambda callback)))
-               (,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
-                                          ',name cb)))
-          ,@body)))
+       lambda (body name &rest callback)
+       `((let* ((cb ,(if (eq (length callback) 1) (car callback) (cons #'lambda callback)))
+                (,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
+                                           ',name cb)))
+           ,@body)))
      (:use-effect
       lambda (body dependencies effect)
       `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
@@ -1591,13 +1598,14 @@ string to insert between the columns."
 
 ;;;; Text field
 
-(lens-defcomponent text-field (_ctx text set-text &key header footer)
+(lens-defcomponent text-field (_ctx text set-text &key header footer props)
   (:use-callback onchange (newtext _newcursor)
                  (funcall set-text newtext))
 
   (lens--field text onchange
                (propertize (or header "[begin field]\n") 'face 'lens-field-header)
-               (propertize (or footer "\n[end field]") 'face 'lens-field-header)))
+               (propertize (or footer "\n[end field]") 'face 'lens-field-header)
+               props))
 
 
 ;;;; Text box
@@ -1633,16 +1641,16 @@ string to insert between the columns."
                :charset 'unicode))
 
   (:use-callback
-   focus ()
-   (set-cursor (length text))
-   (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
-   (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
+    focus ()
+    (set-cursor (length text))
+    (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
+    (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
 
   (:use-callback
-   unfocus ()
-   (set-cursor nil)
-   (setq lens--focused-border-box nil)
-   (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
+    unfocus ()
+    (set-cursor nil)
+    (setq lens--focused-border-box nil)
+    (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
 
   (when lens--focused-border-box
     (plist-put lens--focused-border-box :unfocus unfocus))
@@ -1668,10 +1676,10 @@ string to insert between the columns."
        (plist-put lens--focused-border-box :last-point (point)))))
 
   (:use-callback
-   change-cb (newtext newcursor line-idx)
-   (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
-     (funcall set-text (car res))
-     (set-cursor (cdr res))))
+    change-cb (newtext newcursor line-idx)
+    (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
+      (funcall set-text (car res))
+      (set-cursor (cdr res))))
 
   (propertize
    (string-join
