@@ -1,8 +1,13 @@
-;;; lens.el -*- lexical-binding: t; -*-
+;;; lens.el --- ui library for emacs -*- lexical-binding: t; -*-
+;;; Commentary:
+;;; Code:
 
 (require 'dash)
 (require 'f)
+(require 'ol)
 (require 'org)
+(require 'org-element)
+(require 'org-indent)
 (require 'text-property-search)
 
 
@@ -295,7 +300,9 @@ correct order, the reverse of what was stored.)")
 (defvar lens--modified-fields nil
   "List of (:buffer BUF :pos MARKER :undo? BOOL).")
 
-(bz/face lens-field-header fixed-pitch :fg gray3 :h 0.9)
+(defface lens-field-header '((t (:inherit fixed-pitch :foreground "#707484")))
+  "Header for lens fields.")
+
 (defun lens--field (text onchange &optional head foot props)
   "Create a controlled, modifyable region of text.
 
@@ -401,10 +408,7 @@ The `string-width' function doesn't work correctly in certain situations
 for some reason. For example, it believes an em-dash has width 1."
   (if start (string-width str start end)
     (let ((inhibit-read-only t))
-      (if (boundp #'string-pixel-width)
-          (/ (string-pixel-width str) (string-pixel-width "a"))
-        (require 'shr)
-        (/ (shr-string-pixel-width str) (shr-string-pixel-width "a"))))))
+      (/ (string-pixel-width str) (string-pixel-width "a")))))
 
 (defun lens-text-to-box (text &rest props)
   (pcase-let ((`(,body ,head ,foot) (apply #'lens--textbox-wrap text props)))
@@ -503,7 +507,7 @@ PROPS has the following meaningful properties:
        ;; Add the space to the body
        (if (not (eq (aref text idx) ?\n))
            (add-word (substring text idx (1+ idx)))
-         (add-word (apply #'propertize "¶" 'lens-textbox-newline t 'face 'shadow
+         (add-word (apply #'propertize "¶" 'lens-textbox-newline t 'face 'lens-field-header
                           (text-properties-at idx text)))
          (push "" body-lines)))
      (setq idx (1+ idx)))
@@ -680,7 +684,7 @@ face, as it will trample all other faces in the region."
     (lens--refresh-buffer (point) (+ (point) (length insert)))))
 
 (defun lens--filter-buffer-substring-function (func beg end &optional delete)
-  "Remove lenses from the region"
+  "Remove lenses from the region."
   (let ((str (funcall func beg end delete)))
     (or (ignore-errors (lens-remove-lenses-from-string str)) str)))
 
@@ -1086,7 +1090,7 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 
 ;; Basic gray background
 (defface lens-rerender-highlight '((t (:background "#505464")))
-  "Highlight the sections of the lens that are rerendered")
+  "Highlight the sections of the lens that are rerendered.")
 
 
 (defun lens--ui-state-to-string (state)
@@ -1385,6 +1389,9 @@ the callback. NAME is the name of the callback."
                     nconc (lens--collect-buffer-states child (append path (list key)))))))
 
 (defun lens--propogate-buffer-state (state buffer-states)
+  "Update STATE with values from BUFFER-STATES.
+
+Returns non-nil if any state was changed."
   (let ((any-changed nil))
     (pcase-dolist (`(,path ,hook-idx ,value) buffer-states)
       (when-let ((nested-state (lens--follow-key-path state path)))
@@ -1397,6 +1404,7 @@ the callback. NAME is the name of the callback."
     any-changed))
 
 (defun lens--use-buffer-state-callback (path hook-idx value)
+  "Set the buffer state VALUE for the hook at HOOK-IDX in component at PATH."
   (let* ((root-state (or lens--callback-state
                          (error "Called set-buffer-state outside of a ui callback")))
          (nested-state (lens--follow-key-path root-state path))
@@ -1405,6 +1413,10 @@ the callback. NAME is the name of the callback."
     (setf (cadr hook) value)))
 
 (defun lens--use-buffer-state (initial)
+  "Create a buffer state hook with INITIAL value.
+
+Buffer state is preserved in the undo history.
+Returns a cons of (VALUE . SETTER-FUNCTION)."
   (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
          (hook-idx (plist-get ctx :hook-idx))
          (path (plist-get ctx :path))
@@ -1416,6 +1428,10 @@ the callback. NAME is the name of the callback."
 ;;;; Use effect
 
 (defun lens--ui-run-effects (state path-to-posn &optional key-path)
+  "Run all pending use-effect hooks in STATE and its children.
+
+PATH-TO-POSN is a hash table mapping key paths to buffer positions.
+KEY-PATH is the current path in the component tree."
   (let ((posn (when (plist-get state :hooks)
                 ;; Find the first parent of key-path which has a position
                 (or (cl-loop for i downfrom (length key-path)
@@ -1481,6 +1497,7 @@ be rerun when one of DEPENDENCIES changes."
   (lens--use-effect
    (random)
    (lambda (start end)
+     (message "S %s E %s" start end)
      (let ((ps properties) prop value)
        (while ps
          (setq prop (pop ps) value (pop ps))
@@ -1636,10 +1653,14 @@ hook among all hooks in the current component."
 
 ;;;; Button
 
-(bz/face lens-button custom-button)
-(bz/keys lens-button-map
-  :sparse t
-  "<return>" lens-click)
+(defface lens-button '((t :inherit custom-button))
+  "Face for lens buttons.")
+
+(defvar lens-button-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "<return>") #'lens-click)
+    m)
+  "Keymap local to buttons.")
 
 (defun lens-click ()
   "If there is a ui button at point, call its onclick function."
@@ -1648,7 +1669,7 @@ hook among all hooks in the current component."
     (if click (funcall click)
       (error "Nothing to click"))))
 
-(lens-defcomponent button (ctx label onclick &key face)
+(lens-defcomponent button (_ctx label onclick &key face)
   :can-be-column t
   (propertize (format " %s " label)
               'lens-click onclick
@@ -1731,7 +1752,7 @@ string to insert between the columns."
   (:use-state unique-id _set-unique-id (abs (random)))
   (setq cursor (when cursor (min cursor (length text))))
 
-  (:let border-face 'shadow)
+  (:let border-face 'lens-field-header)
 
   (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
               (lens--textbox-wrap
@@ -1797,7 +1818,7 @@ string to insert between the columns."
                          (funcall change-cb newtext newcursor scoped-line-idx)))
                      (substring prefix 0 -1)
                      (substring suffix 1 -1)
-                     (unless cursor (list 'face 'shadow 'read-only t))))
+                     (unless cursor (list 'face border-face 'read-only t))))
            (list footer))
     (propertize "\n" 'read-only t))
    'keymap map))
@@ -1835,6 +1856,11 @@ string to insert between the columns."
         (plist-put lens--focused-border-box :last-point (point))))))
 
 (defun lens--border-box-callback (body line-idx new-line-text cursor-col)
+  "Process a modification to a border box.
+
+BODY is the list of lines, LINE-IDX is the modified line index,
+NEW-LINE-TEXT is the new text, and CURSOR-COL is the cursor column.
+Returns (NEW-CONTENT . NEW-CURSOR)."
   (let ((new-content "")
         deleted-bol new-cursor line)
 
@@ -1866,17 +1892,29 @@ string to insert between the columns."
 ;;;; Ui Functions
 
 (defun lens-read-ui (&optional prompt)
+  "Prompt the user to select a UI from `lens-ui-alist'.
+
+PROMPT is the prompt string to display."
   (let ((name (completing-read (or prompt "Ui: ") (mapcar #'car lens-ui-alist))))
     (alist-get (intern name) lens-ui-alist)))
 
 
 (defun lens--replace-create (beg end src-func display)
+  "Replace region from BEG to END with a new lens.
+
+SRC-FUNC is called with the region text to create the source.
+DISPLAY is the display specification for the lens."
   (let ((str (buffer-substring-no-properties beg end)))
     (lens-silent-edit
      (delete-region beg end)
      (lens-create (funcall src-func str) display))))
 
 (defun lens--wrapped-create (hb he fb fe src-func display)
+  "Create a lens from a wrapped region with header and footer.
+
+HB, HE, FB, FE are the bounds of the header and footer.
+SRC-FUNC is called with (BODY HEAD FOOT) to create the source.
+DISPLAY is the display specification for the lens."
   (let ((head (buffer-substring-no-properties hb he))
         (body (buffer-substring-no-properties he fb))
         (foot (buffer-substring-no-properties fb fe)))
@@ -1888,24 +1926,29 @@ string to insert between the columns."
 ;;;; Creation Functions
 
 (defun lens-create-buffer (beg end buffer)
+  "Create a lens displaying BUFFER, replacing region from BEG to END."
   (interactive (list (point) (if mark-active (mark) (point)) (read-buffer "Buffer: ")))
   (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-raw-display)))
 
 (defun lens-create-file (beg end file)
+  "Create a lens displaying FILE, replacing region from BEG to END."
   (interactive (list (point) (if mark-active (mark) (point)) (read-file-name "File: ")))
   (lens--replace-create beg end (lambda (str) (lens-file-source file str)) (lens-raw-display)))
 
 (defun lens-create-ui (beg end ui)
+  "Create a lens with UI display, replacing region from BEG to END."
   (interactive (list (point) (if mark-active (mark) (point))
                      (or (lens-read-ui) (error "No ui selected"))))
   (lens--replace-create beg end #'lens-replace-source (lens-ui-display ui)))
 
 (defun lens-create-buffer-ui (beg end buffer ui)
+  "Create a lens displaying BUFFER with UI, replacing region from BEG to END."
   (interactive (list (point) (if mark-active (mark) (point))
                      (read-buffer "Buffer: ") (lens-read-ui)))
   (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-ui-display ui)))
 
 (defun lens-create-new-file (path)
+  "Create a new file at PATH and insert a lens displaying it."
   (interactive (list (read-file-name "Create Lens: " "lenses/")))
 
   (let* ((rel1 (f-relative path (f-parent buffer-file-name)))
@@ -1988,6 +2031,7 @@ all overlays."
 
 (defvar lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens\n")
 (defun lens-auto--org-block ()
+  "Create a lens from an org #+begin_lens block at the current match."
   (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
         (hb (match-beginning 0)) (he (match-beginning 2))
         (fb (match-end 2)) (fe (match-end 0)))
@@ -1995,13 +2039,16 @@ all overlays."
 
 
 (defun lens--org-forward-filter (text)
+  "Escape org headings in TEXT by wrapping them in underscores."
   (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
 
 (defun lens--org-backward-filter (text)
+  "Unescape org headings in TEXT by removing surrounding underscores."
   (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
 
-(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-any-link-re))
+(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-link-any-re))
 (defun lens-auto--org-file-link ()
+  "Create a lens from an org file link at the current match."
   (let* ((beg (match-beginning 0)) (end (match-end 0))
          (context (org-element-context))
          (link-type (and (eq (car context) 'link) (org-element-property :type context)))
@@ -2035,6 +2082,9 @@ all overlays."
     (lens-auto-insert-all)))
 
 (defun lens-auto-search-forward ()
+  "Search forward for the next auto-lens match.
+
+Returns the matching entry from `lens-auto-matchers', or nil if none found."
   (let ((init (point))
         match-pos match-assoc)
     (dolist (assoc lens-auto-matchers)
@@ -2048,6 +2098,7 @@ all overlays."
       match-assoc)))
 
 (defun lens-auto-insert-all ()
+  "Insert lenses for all auto-lens matches in the current buffer."
   (interactive)
   (let (assoc end)
     (save-excursion
@@ -2059,6 +2110,7 @@ all overlays."
         (goto-char end)))))
 
 (defun lens-auto-at-point ()
+  "Insert an auto-lens at point if one matches."
   (interactive)
   (let ((target (point))
         done assoc)
@@ -2077,44 +2129,68 @@ all overlays."
 
 ;;; Boxes
 
-(bz/face lens-box-overline :o "lightskyblue4")
-(bz/face lens-box-underline :u (:color "lightskyblue4"))
+(defface lens-box-overline '((t :overline "lightskyblue4"))
+  "Face for lens box overline.")
+(defface lens-box-underline '((t :underline (:color "lightskyblue4")))
+  "Face for lens box underline.")
 
-(bz/face lens-box-body :bg bg :x t)
-(bz/face lens-box-head (lens-box-body lens-box-overline fixed-pitch) :h 0.9 :fg blue :w bold)
-(bz/face lens-box-foot (lens-box-body lens-box-underline fixed-pitch) :h 1)
+(defface lens-box-body '((t :background "gray20" :extend t))
+  "Face for lens box body.")
+(defface lens-box-head '((t :inherit (lens-box-body lens-box-overline fixed-pitch)
+                            :height 0.9 :foreground "steelblue" :weight bold))
+  "Face for lens box head.")
+(defface lens-box-foot '((t :inherit (lens-box-body lens-box-underline fixed-pitch) :height 1.0))
+  "Face for lens box foot.")
 
-(bz/face lens-box-vert :bg "lightskyblue4")
-(bz/face lens-box-padding lens-box-body :bg bg)
+(defface lens-box-vert '((t :background "lightskyblue4"))
+  "Face for lens box vertical line.")
+(defface lens-box-padding '((t :inherit lens-box-body))
+  "Face for lens box padding.")
 
-(setq lens-box-margin 5)
-(setq lens-box-padding 8)
-(setq lens-line-prefix
-      (let* ((space (lambda (w) (propertize " " 'display `(space :width (,w))))))
-        (concat (funcall space lens-box-margin)
-                (propertize (funcall space 1) 'face 'lens-box-vert)
-                (propertize (funcall space lens-box-padding) 'face 'lens-box-padding))))
-(setq lens-head-prefix (let ((s (substring lens-line-prefix)))
-                         (prog1 s (add-face-text-property 2 3 'lens-box-overline nil s)
-                                (add-face-text-property 2 3 '(:height 1.2) nil s))))
-(setq lens-foot-prefix (let ((s (substring lens-line-prefix)))
-                         (prog1 s (add-face-text-property 2 3 'lens-box-underline nil s)
-                                (add-face-text-property 0 3 '(:height 1) nil s))))
+(defvar lens-box-margin 5
+  "Width of the margin outside the lens box border.")
+(defvar lens-box-padding 8
+  "Width of the padding inside the lens box border.")
 
-(bz/keys lens-header-map
-  :sparse t
-  :parent org-mode-map
-  [remap bz/fold-toggle] lens-fold-toggle
-  )
+(defvar lens-line-prefix
+  (let* ((space (lambda (w) (propertize " " 'display `(space :width (,w))))))
+    (concat (funcall space lens-box-margin)
+            (propertize (funcall space 1) 'face 'lens-box-vert)
+            (propertize (funcall space lens-box-padding) 'face 'lens-box-padding)))
 
-(setq lens-box-style
-      (list :props (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix)
-            :face 'lens-box-body
-            :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix
-                              'local-map lens-header-map 'keymap lens-header-map)
-            :head-face 'lens-box-head
-            :foot-props (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix)
-            :foot-face 'lens-box-foot)
-      lens-default-style lens-box-style)
+  "Line prefix string for lens box body lines.")
+(defvar lens-head-prefix
+  (let ((s (substring lens-line-prefix)))
+    (prog1 s (add-face-text-property 2 3 'lens-box-overline nil s)
+           (add-face-text-property 2 3 '(:height 1.2) nil s)))
 
-;; (setq lens-default-style nil)
+  "Line prefix string for lens box header lines.")
+(defvar lens-foot-prefix
+  (let ((s (substring lens-line-prefix)))
+    (prog1 s (add-face-text-property 2 3 'lens-box-underline nil s)
+           (add-face-text-property 0 3 '(:height 1) nil s)))
+  "Line prefix string for lens box footer lines.")
+
+(defvar lens-header-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "SPC") #'lens-fold-toggle)
+    m)
+  "Map local to the lens header and footer.")
+
+(defvar lens-box-style
+  (list :props (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix)
+        :face 'lens-box-body
+        :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix
+                          'local-map lens-header-map 'keymap lens-header-map)
+        :head-face 'lens-box-head
+        :foot-props (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix)
+        :foot-face 'lens-box-foot)
+  "Style plist for rendering lenses as bordered boxes.")
+
+(defvar lens-default-style lens-box-style
+  "Default style used for rendering lenses.")
+
+
+;;; lens.el ends here
+
+(provide 'lens)
