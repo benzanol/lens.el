@@ -1091,7 +1091,9 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 
 (defun lens--ui-nested-use-states (state)
   (let ((content (plist-get state :content)))
-    (cons (--filter (eq (car it) :use-state) (plist-get state :hooks))
+    (cons (cl-loop for hook in (plist-get state :hooks)
+                   when (eq (car hook) :use-state)
+                   collect (cadr hook))
           (when (listp content)
             (--map (lens--ui-nested-use-states (cdr it)) content)))))
 
@@ -1229,7 +1231,7 @@ might be new."
          (error "Invalid component key path"))
      (cdr path))))
 
-(defun lens--perform-callback (state path name)
+(defun lens--perform-callback (state path name args)
   "Perform a named callback.
 
 STATE is the root ui state. PATH is the path to the component containing
@@ -1240,41 +1242,50 @@ the callback. NAME is the name of the callback."
          (hook (or (--find (and (eq (car it) :use-callback)
                                 (eq (cadr it) name))
                            (plist-get nested-state :hooks))
-                   (error "Callback not found %s %s" path name))))
+                   (error "Callback not found %s %s" path name)))
+         region old-rows)
 
     ;; If this is a callback called from within another callback
     (if lens--callback-state
-        (funcall (caddr hook))
+        (apply (caddr hook) args)
 
       ;; This is the root-level callback, so we need to handle updating the lens
       (with-current-buffer (plist-get state :buffer)
-        (lens-save-position-in-ui
-         (goto-char (point-min))
+        (save-excursion
+          (goto-char (point-min))
 
-         (or (text-property-search-forward
-              'lens-begin state
-              #'(lambda (st lens) (eq st (car (caddr lens)))))
-             (error "Lens not found"))
+          (or (text-property-search-forward
+               'lens-begin state
+               #'(lambda (st lens) (eq st (car (caddr lens)))))
+              (error "Lens not found"))
 
-         (let ((region (lens-at-point))
-               (old-rows (lens--ui-string-rows state nil)))
+          (setq region (lens-at-point)))
+        (setq old-rows (lens--ui-string-rows state nil))
 
-           ;; Since we specifically searched for a lens with the correct state,
-           ;; this should never be an issue, but check just in case
-           (unless (eq (car (caddr (car region))) state)
-             (error "Lens at point is for the incorrect state"))
+        ;; Since we specifically searched for a lens with the correct state,
+        ;; this should never be an issue, but check just in case
+        (unless (eq (car (caddr (car region))) state)
+          (error "Lens at point is for the incorrect state"))
 
-           (let ((lens--callback-state state))
-             (funcall (caddr hook)))
+        (let ((lens--callback-state state))
+          (apply (caddr hook) args))
 
-           (lens--generate-ui (plist-get state :ui-func) nil
-                              state state)
+        (lens--generate-ui (plist-get state :ui-func) nil
+                           state state)
 
-           (lens-modify region (cons state nil) nil
-                        (lambda (he fb)
-                          (lens--ui-renderer state old-rows he fb)))))))))
+        (lens-modify region (cons state nil) nil
+                     (lambda (he fb)
+                       (lens--ui-renderer state old-rows he fb)))))))
 
 (defun lens--use-callback (ctx name cb)
+  "Register a :use-callback hook.
+
+The hook is stored with the format
+
+\(:use-callback NAME CALLBACK COMMAND)
+
+This function returns COMMAND."
+
   (let* ((state (plist-get ctx :state))
          (hooks (plist-get state :hooks))
          (hook-idx (plist-get ctx :hook-idx))
@@ -1285,8 +1296,12 @@ the callback. NAME is the name of the callback."
     (if (plist-get ctx :is-first-call)
         ;; Add a hook to the hooks list
         (progn (cl-assert (eq (length hooks) hook-idx))
-               (setq hook (list :use-callback name cb))
+               (setq hook (list :use-callback name cb
+                                `(lambda (&rest args)
+                                   (interactive)
+                                   (lens--perform-callback ',root-state ',path ',name args))))
                (plist-put state :hooks (nconc hooks (list hook))))
+
       ;; Check if the indexed hook is a use-callback hook
       (setq hook (nth hook-idx hooks))
       (unless hook (error "Called :use-callback hook where no hook was previously"))
@@ -1294,7 +1309,7 @@ the callback. NAME is the name of the callback."
       (setf (caddr hook) cb))
 
     (plist-put ctx :hook-idx (1+ hook-idx))
-    `(lambda () (lens--perform-callback ',root-state ',path ',name))))
+    (nth 3 hook)))
 
 
 ;;;; Use state
@@ -1454,9 +1469,10 @@ hook among all hooks in the current component."
           (cl-flet ((,set-var ,set-var))
             ,@body))))
      (:use-callback
-      lambda (body name callback)
-      `((let ((,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
-                                         ',name ,callback)))
+      lambda (body name &rest callback)
+      `((let* ((cb ,(if (eq (length callback) 1) (car callback) (cons #'lambda callback)))
+               (,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
+                                          ',name cb)))
           ,@body)))
      (:use-effect
       lambda (body dependencies effect)
@@ -1584,7 +1600,7 @@ string to insert between the columns."
 (defvar-local lens--focused-border-box nil
   "The focused border box in the current buffer, or nil.")
 
-(lens-defcomponent wrapped-box (ctx text set-text &key onenter width)
+(lens-defcomponent text-box (_ctx text set-text &key onenter width)
   :can-be-column t
 
   (:use-state cursor set-cursor nil)
@@ -1601,28 +1617,31 @@ string to insert between the columns."
                :title (if cursor "Esc to unfocus" "Enter to focus")
                :charset 'unicode))
 
-  (:flet focus ()
-         (set-cursor (length text))
-         (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
-         (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
-  (:flet unfocus ()
-         (set-cursor nil)
-         (setq lens--focused-border-box nil)
-         (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
-  (:let map (if cursor
-                `(keymap (escape . ,(lens-ui-callback ctx (unfocus)))
-                         (return . ,(when onenter (lambda () (interactive)
-                                                    (lens--ui-callback ctx onenter)))))
-              `(keymap (return . ,(lens-ui-callback ctx (focus))))))
+  (:use-callback
+   focus ()
+   (set-cursor (length text))
+   (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
+   (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
+
+  (:use-callback
+   unfocus ()
+   (set-cursor nil)
+   (setq lens--focused-border-box nil)
+   (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
 
   (when lens--focused-border-box
-    (plist-put lens--focused-border-box :unfocus (lens-ui-callback ctx (unfocus))))
+    (plist-put lens--focused-border-box :unfocus unfocus))
+
+  (:let map (if cursor
+                `(keymap (escape . ,unfocus) (return . ,onenter))
+              `(keymap (return . ,focus))))
 
   ;; Run the hooks when focus changes
   (:use-effect
    (not cursor)
    (lambda (_ _) (run-hook-with-args (if cursor 'lens-box-enter-hook 'lens-box-exit-hook))))
 
+  ;; Update the cursor at the end
   (:use-effect
    (list cursor-line cursor-col)
    (lambda (start _end)
@@ -1632,6 +1651,12 @@ string to insert between the columns."
        (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
        (forward-char cursor-col)
        (plist-put lens--focused-border-box :last-point (point)))))
+
+  (:use-callback
+   change-cb (newtext newcursor line-idx)
+   (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
+     (funcall set-text (car res))
+     (set-cursor (cdr res))))
 
   (propertize
    (string-join
@@ -1643,14 +1668,9 @@ string to insert between the columns."
                     collect
                     (lens--field
                      (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
-                     (let ((cur-line-idx line-idx))
+                     (let ((scoped-line-idx line-idx))
                        (lambda (newtext newcursor)
-                         (lens--ui-callback
-                          ctx
-                          (lambda ()
-                            (let ((res (lens--border-box-callback body cur-line-idx newtext newcursor)))
-                              (funcall set-text (car res))
-                              (set-cursor (cdr res)))))))
+                         (funcall change-cb newtext newcursor scoped-line-idx)))
                      (substring prefix 0 -1)
                      (substring suffix 1 -1)
                      (unless cursor (list 'face 'shadow 'read-only t))))
