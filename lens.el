@@ -1089,19 +1089,22 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
   "Highlight the sections of the lens that are rerendered")
 
 
-
 (defun lens--ui-state-to-string (state)
   (cl-loop for ((keys) . string) in (lens--ui-string-rows state nil)
            for newline = (propertize "\n" 'read-only t 'lens-element-key keys)
            concat (concat string newline)))
 
-(defun lens--ui-nested-use-states (state)
+(defun lens--ui-nested-rerender-hooks (state)
+  "Return a nested list of hooks which are relevant for rerendering.
+
+This is for the purpose of calculating diffs between ui states."
   (let ((content (plist-get state :content)))
     (cons (cl-loop for hook in (plist-get state :hooks)
-                   when (eq (car hook) :use-state)
+                   when (or (eq (car hook) :use-state)
+                            (eq (car hook) :use-buffer-state))
                    collect (cadr hook))
           (when (listp content)
-            (--map (lens--ui-nested-use-states (cdr it)) content)))))
+            (--map (lens--ui-nested-rerender-hooks (cdr it)) content)))))
 
 (defun lens--ui-string-rows (state key-path)
   "Returns a list of rows.
@@ -1114,7 +1117,7 @@ This format is designed to be suitable for diffing, as used in
          (element (plist-get state :element))
          (renderer (plist-get state :renderer)))
     (if (or (stringp content) renderer)
-        (list (cons (list key-path element (lens--ui-nested-use-states state))
+        (list (cons (list key-path element (lens--ui-nested-rerender-hooks state))
                     (if (not renderer) content
                       (funcall renderer
                                (--map (lens--ui-state-to-string (cdr it)) content)))))
@@ -1265,7 +1268,7 @@ Creates an intermediate ui-generation context which is a plist containing:
 (defvar lens--callback-state nil
   "A copy of the root-level state of the ui, which should be mutated.")
 
-(defun lens--use-callback (ctx name cb)
+(defun lens--use-callback (name cb)
   "Register a :use-callback hook.
 
 \(:use-callback NAME CALLBACK SYMBOL)
@@ -1273,7 +1276,8 @@ Creates an intermediate ui-generation context which is a plist containing:
 Where SYMBOL is a custom symbol whose function value is set to call this
 hook. This function returns SYMBOL."
 
-  (let* ((root-state (plist-get ctx :root-state))
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         (root-state (plist-get ctx :root-state))
          (ui-id (plist-get root-state :ui-id))
          (path (plist-get ctx :path))
          (hook
@@ -1346,11 +1350,8 @@ the callback. NAME is the name of the callback."
         (lens--generate-ui (plist-get state :ui-func) nil
                            state state)
 
-        (lens-modify region
-                     (cons state (lens--collect-buffer-states state nil))
-                     nil
-                     (lambda (he fb)
-                       (lens--ui-renderer state old-rows he fb)))))))
+        (lens-modify region (cons state (lens--collect-buffer-states state nil)) nil
+                     (lambda (he fb) (lens--ui-renderer state old-rows he fb)))))))
 
 
 ;;;; Use state
@@ -1363,8 +1364,9 @@ the callback. NAME is the name of the callback."
          (hook (nth hook-idx hooks)))
     (setf (cadr hook) value)))
 
-(defun lens--use-state (ctx initial)
-  (let* ((hook-idx (plist-get ctx :hook-idx))
+(defun lens--use-state (initial)
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         (hook-idx (plist-get ctx :hook-idx))
          (path (plist-get ctx :path))
          (hook (lens--register-hook ctx :use-state initial))
          (value (cadr hook)))
@@ -1402,8 +1404,9 @@ the callback. NAME is the name of the callback."
          (hook (nth hook-idx hooks)))
     (setf (cadr hook) value)))
 
-(defun lens--use-buffer-state (ctx initial)
-  (let* ((hook-idx (plist-get ctx :hook-idx))
+(defun lens--use-buffer-state (initial)
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         (hook-idx (plist-get ctx :hook-idx))
          (path (plist-get ctx :path))
          (hook (lens--register-hook ctx :use-buffer-state initial))
          (value (cadr hook)))
@@ -1428,7 +1431,7 @@ the callback. NAME is the name of the callback."
           (lens--ui-run-effects (cdr child) path-to-posn
                                 (append key-path (list (car child)))))))))
 
-(defun lens--use-effect (ctx dependencies effect)
+(defun lens--use-effect (dependencies effect)
   "Define a use-effect hook.
 
 The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
@@ -1437,7 +1440,8 @@ this particular render.
 
 The 3rd parameter is t if this is the first render, or if the
 dependencies changed since the last render."
-  (let* ((hook (lens--register-hook ctx :use-effect
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         (hook (lens--register-hook ctx :use-effect
                  effect dependencies t)))
 
     ;; Set the callback to the new callback
@@ -1451,13 +1455,14 @@ dependencies changed since the last render."
 
 ;;;; Use memo
 
-(defun lens--use-memo (ctx generator dependencies)
+(defun lens--use-memo (dependencies generator)
   "Store a memoized value.
 
 GENERATOR is a 1-argument function which takes the old value and
 generates a new value. DEPENDENCIES is a list of values. The memo will
 be rerun when one of DEPENDENCIES changes."
-  (let* ((hook (lens--register-hook ctx :use-memo
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         (hook (lens--register-hook ctx :use-memo
                  generator dependencies (funcall generator nil))))
 
     ;; Set the generator to the new generator
@@ -1467,6 +1472,17 @@ be rerun when one of DEPENDENCIES changes."
       (setf (caddr hook) dependencies)
       (setf (nth 3 hook) (funcall generator (nth 3 hook))))
     (nth 3 hook)))
+
+
+;;;; Use text properties
+
+(defun lens--use-text-properties (properties)
+  "Set additional text properties for the entire region."
+  (lens--use-effect
+   (random)
+   (lambda (start end)
+     (let ((ps properties))
+       (while ps (put-text-property start end (pop ps) (pop ps)))))))
 
 
 ;;;; Ui display
@@ -1533,38 +1549,37 @@ hook among all hooks in the current component."
 
 (defmacro lens-ui-body (&rest body)
   `(lens-let-body
-    [(:use-state
+    [(:use-callback
+       lambda (body name &rest cb)
+       `((let* ((cb ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))
+                (,name (lens--use-callback ',name cb)))
+           ,@body)))
+     (:use-state
       lambda (body state-var set-var initial)
-      `((let* ((=use-state= (lens--use-state (or lens--current-ctx (error "No containing lens context"))
-                                             ,initial))
+      `((let* ((=use-state= (lens--use-state ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
             ,@body))))
      (:use-buffer-state
       lambda (body state-var set-var initial)
-      `((let* ((=use-state= (lens--use-buffer-state (or lens--current-ctx (error "No containing lens context"))
-                                                    ,initial))
+      `((let* ((=use-state= (lens--use-buffer-state ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
             ,@body))))
-     (:use-callback
-       lambda (body name &rest callback)
-       `((let* ((cb ,(if (eq (length callback) 1) (car callback) (cons #'lambda callback)))
-                (,name (lens--use-callback (or lens--current-ctx (error "No containing lens context"))
-                                           ',name cb)))
-           ,@body)))
-     (:use-effect
-      lambda (body dependencies effect)
-      `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
-                          ,dependencies ,effect)
-        ,@body))
      (:use-memo
-      lambda (body var dependencies generator)
-      `((let ((,var (lens--use-memo (or lens--current-ctx (error "No containing lens context"))
-                                    ,generator ,dependencies)))
+      lambda (body var dependencies &rest cb)
+      `((let ((,var (lens--use-memo ,dependencies ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))))
           ,@body)))
+     (:use-effect
+      lambda (body dependencies &rest cb)
+      `((lens--use-effect ,dependencies ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))
+        ,@body))
+     (:use-text-properties
+      lambda (body &rest properties)
+      `((lens--use-text-properties (cons #'list ,properties))
+        ,@body))
      (:use-renderer
       lambda (body ctx renderer)
       (let ((ctx-expr '(or lens--current-ctx (error "No containing lens context"))))
