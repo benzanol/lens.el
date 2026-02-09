@@ -5,51 +5,94 @@
 
 (setq vec nil)
 
+(bz/face lens-chat-user :bg bg :x t)
+(bz/face lens-chat-ai :bg bg3 :x t)
+(bz/face lens-chat-header :h 0.5 :w bold :fg gray1)
+(bz/face lens-chat-footer :h 0.5)
+
 (lens-defui chat (ctx)
+  (list `(chat :chat)))
+
+(lens-defcomponent chat (ctx)
+  (:use-state input set-input "hi")
+  (:use-state history set-history nil)
+
+  (:use-callback
+    stream-cb (output)
+    (let ((first (car history)))
+      (setf (cadr first) (concat (cadr first) output))
+      (set-history history)))
+
+  (:use-callback
+    send-cb ()
+    (set-input "")
+    (set-history (cons (list input "") history))
+
+    (streaming-llm-request
+     "openai/gpt-4.1-mini" input (reverse history)
+     (streaming-llm--batch-callback
+      (lambda (output)
+        (unless (eq output 'done)
+          (funcall stream-cb output)))
+      0.05)))
+
+  (:let field-props
+        `(keymap (keymap (return . ,send-cb))))
+
+
+  `((string :space "")
+    ,@(--map-indexed
+       (list 'string (intern (format ":chat-%s" it-index))
+             (concat (propertize (concat (car it) "\n") 'face 'lens-chat-user) "\n"
+                     (propertize (concat "" "\n") 'face '(lens-chat-ai lens-chat-header))
+                     (propertize (concat (cadr it) "\n") 'face 'lens-chat-ai)
+                     (propertize "\n" 'face '(lens-chat-ai lens-chat-footer))))
+       (reverse history))
+
+    (text-field :input ,input ,set-input :props ,field-props)
+    ;; (text-field :input ,input ,set-input :onenter ,send-cb :width 50)
+    (button :send "Send" ,send-cb)))
+
+
+(lens-defui chat-boxed (ctx)
   (:use-state input set-input "hi")
   (:use-state history set-history nil)
 
   (:flet make-box (title text)
          (lens-text-to-box text
-                           :width 60 :shrink t
+                           :width 120 :shrink t
                            :title title :charset 'unicode
                            :box-props '(face shadow)))
 
-  (:let llm-cb (lambda (output)
-                 (lens--ui-callback
-                  ctx
-                  (lambda ()
-                    (let ((first (car history)))
-                      (setf (cadr first) (concat (cadr first) output))
-                      (setf (nth 3 first) (make-box "AI" (cadr first)))
-                      (set-history history))))))
+  (:use-callback
+    stream-cb (output)
+    (let ((first (car history)))
+      (setf (cadr first) (concat (cadr first) output))
+      (setf (nth 3 first) (make-box "AI" (cadr first)))
+      (set-history history)))
 
-  ;; Define a vector to hold the callback. Since vectors don't get
-  ;; cloned, this serves as a cell which can
-  (:use-state llm-cb-cell set-llm-cb-cell (vector nil))
-  (aset llm-cb-cell 0 llm-cb)
+  (:use-callback
+    send-cb ()
+    (set-input "")
+    (set-history (cons (list input "" (make-box "User" input) (make-box "AI" "...")) history))
 
-  (:let send-fn
-        (lambda ()
-          (set-input "")
-          (set-history (cons (list input "" (make-box "User" input) (make-box "AI" "...")) history))
+    (streaming-llm-request
+     "openai/gpt-4.1-mini" input (reverse history)
+     (streaming-llm--batch-callback
+      (lambda (output)
+        (unless (eq output 'done)
+          (funcall stream-cb output)))
+      0.05)))
 
-          (streaming-llm-request
-           "openai/gpt-4.1-mini" input (reverse history)
-           (streaming-llm--batch-callback
-            (lambda (output)
-              (unless (eq output 'done)
-                (funcall (aref llm-cb-cell 0) output)))
-            0.05))))
 
   `(,@(--map-indexed
        (list 'string (intern (format ":chat-%s" it-index))
              (concat (nth 2 it) "\n" (nth 3 it)))
        (reverse history))
 
-    (wrapped-box :box ,input ,set-input :onenter ,send-fn :width 50)
-
-    (button :send-button "Send" ,send-fn)))
+    (text-box :input ,input ,set-input :onenter ,send-cb :width 50)
+    ;; (text-field :input ,input ,set-input :onenter ,send-cb :width 50)
+    (button :send "Send" ,send-cb)))
 
 
 (defun streaming-llm-request (model prompt history callback)
