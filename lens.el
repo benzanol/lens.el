@@ -1481,8 +1481,17 @@ be rerun when one of DEPENDENCIES changes."
   (lens--use-effect
    (random)
    (lambda (start end)
-     (let ((ps properties))
-       (while ps (put-text-property start end (pop ps) (pop ps)))))))
+     (let ((ps properties) prop value)
+       (while ps
+         (setq prop (pop ps) value (pop ps))
+         (pcase prop
+           ('face (add-face-text-property start end value t))
+           ('keymap
+            (alter-text-property
+             start end 'keymap
+             (lambda (existing)
+               (if existing (list 'keymap existing value)))))
+           (_ (put-text-property start end prop value))))))))
 
 
 ;;;; Ui display
@@ -1578,7 +1587,7 @@ hook among all hooks in the current component."
         ,@body))
      (:use-text-properties
       lambda (body &rest properties)
-      `((lens--use-text-properties (cons #'list ,properties))
+      `((lens--use-text-properties ,(cons #'list properties))
         ,@body))
      (:use-renderer
       lambda (body ctx renderer)
@@ -1688,14 +1697,16 @@ string to insert between the columns."
 
 ;;;; Text field
 
-(lens-defcomponent text-field (_ctx text set-text &key header footer props)
+(lens-defcomponent text-field (_ctx text set-text &key header footer props focus)
   (:use-callback onchange (newtext _newcursor)
                  (funcall set-text newtext))
 
-  (lens--field text onchange
-               (propertize (or header "[begin field]\n") 'face 'lens-field-header)
-               (propertize (or footer "\n[end field]") 'face 'lens-field-header)
-               props))
+  (setq header (propertize (or header "[begin field]\n") 'face 'lens-field-header))
+  (setq footer (propertize (or footer "\n[end field]") 'face 'lens-field-header))
+
+  (:use-effect focus (_start end) (when focus (goto-char (- end (length footer) 1))))
+
+  (lens--field text onchange header footer props))
 
 
 ;;;; Text box
