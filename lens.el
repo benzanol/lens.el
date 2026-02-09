@@ -1180,16 +1180,17 @@ mutated), or nil if this is the first time generating the component.
 ROOT-STATE is the root state for the ui, or nil if this is the root
 component, and it is the first time generating the root component.
 
-Returns a ui context with the following properties:
+Returns the state value used for the new element. This will be either
+OLD-STATE (if non nil), ROOT-STATE (if this is the root component), or a
+newly created state value.
+
+Creates an intermediate ui-generation context which is a plist containing:
   :state - The internal state for the component being called
   :root-state - The root state for the ui
   :is-first-call - Indicates whether calling a UI component for the
     first time, or a subsequent time.
   :path - The key path to the current level
-  :hook-idx - How many hooks have been processed in the current level
-
-The only property that really matters for the return is :state, which
-might be new."
+  :hook-idx - How many hooks have been processed in the current level"
   (let* ((state (or old-state (and (null path) root-state)
                     (list :hooks nil :content nil)))
          (ctx (list :state state
@@ -1212,16 +1213,13 @@ might be new."
                                     ((memq (cadr it) child-keys)
                                      (error "Duplicate child key: %s" (cadr it)))
                                     (t (car (push (cadr it) child-keys))))
-                              (plist-get
-                               (lens--generate-ui
-                                it (append path (list (cadr it)))
-                                (alist-get (cadr it) old-children)
-                                (plist-get ctx :root-state))
-                               :state))
+                              (lens--generate-ui
+                               it (append path (list (cadr it)))
+                               (alist-get (cadr it) old-children)
+                               (plist-get ctx :root-state)))
                         output)))
 
-    (plist-put state :element (unless (functionp elem) elem))
-    ctx))
+    (plist-put state :element (unless (functionp elem) elem))))
 
 
 ;;;; Use callback
@@ -1456,8 +1454,7 @@ hook among all hooks in the current component."
                            :ui-id ui-id
                            :buffer (current-buffer)
                            :ui-func ui-func)))
-              (lens--generate-ui ui-func nil nil state)
-              (cons state nil)))
+              (cons (lens--generate-ui ui-func nil nil state) nil)))
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
