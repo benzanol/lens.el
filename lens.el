@@ -1084,6 +1084,12 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 
 ;;;; Rendering
 
+;; Basic gray background
+(defface lens-rerender-highlight '((t (:background "#505464")))
+  "Highlight the sections of the lens that are rerendered")
+
+
+
 (defun lens--ui-state-to-string (state)
   (cl-loop for ((keys) . string) in (lens--ui-string-rows state nil)
            for newline = (propertize "\n" 'read-only t 'lens-element-key keys)
@@ -1133,7 +1139,9 @@ This format is designed to be suitable for diffing, as used in
          ;; The last pass through is just to record the end positions of the last element
          (when action
            (if (eq action :insert)
-               (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
+               (progn (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
+                      (let ((ol (make-overlay start (point))))
+                        (overlay-put ol 'face 'lens-rerender-highlight)))
              ;; The match is the newline at the end of the old element
              (setq match (text-property-search-forward 'lens-element-key))
              (cl-assert match)
@@ -1157,6 +1165,13 @@ This format is designed to be suitable for diffing, as used in
 
            ;; Update last-key-path
            (setq last-key-path key-path)))))
+
+    (run-with-timer
+     0.07 nil
+     #'(lambda (buf)
+         (with-current-buffer buf
+           (remove-overlays nil nil 'face 'lens-rerender-highlight)))
+     (current-buffer))
 
     ;; Run any use effect callbacks
     (lens--ui-run-effects state key-path-to-posns)))
@@ -1434,6 +1449,26 @@ dependencies changed since the last render."
       (setf (nth 3 hook) t))))
 
 
+;;;; Use memo
+
+(defun lens--use-memo (ctx generator dependencies)
+  "Store a memoized value.
+
+GENERATOR is a 1-argument function which takes the old value and
+generates a new value. DEPENDENCIES is a list of values. The memo will
+be rerun when one of DEPENDENCIES changes."
+  (let* ((hook (lens--register-hook ctx :use-memo
+                 generator dependencies (funcall generator nil))))
+
+    ;; Set the generator to the new generator
+    (setf (cadr hook) generator)
+    ;; Check if the dependencies have changed
+    (unless (equal dependencies (caddr hook))
+      (setf (caddr hook) dependencies)
+      (setf (nth 3 hook) (funcall generator (nth 3 hook))))
+    (nth 3 hook)))
+
+
 ;;;; Ui display
 
 (defun lens-ui-display (ui-func)
@@ -1525,6 +1560,11 @@ hook among all hooks in the current component."
       `((lens--use-effect (or lens--current-ctx (error "No containing lens context"))
                           ,dependencies ,effect)
         ,@body))
+     (:use-memo
+      lambda (body var dependencies generator)
+      `((let ((,var (lens--use-memo (or lens--current-ctx (error "No containing lens context"))
+                                    ,generator ,dependencies)))
+          ,@body)))
      (:use-renderer
       lambda (body ctx renderer)
       (let ((ctx-expr '(or lens--current-ctx (error "No containing lens context"))))
