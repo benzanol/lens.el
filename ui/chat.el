@@ -25,6 +25,7 @@
 
   (:use-callback
     send-cb ()
+    (message "SEND CB")
     (set-input "")
     (set-history (cons (list input "") history))
 
@@ -36,11 +37,12 @@
           (funcall stream-cb output)))
       0.05)))
 
-  (:let field-props
-        `(keymap (keymap (return . ,send-cb))))
+  (:use-callback focus-field () (lens-ui-focus ctx :input))
+  (:use-text-properties 'keymap `(keymap (return . ,focus-field)))
 
+  (:let field-props `(keymap (keymap (return . ,send-cb))))
 
-  `((string :space "")
+  `((string :space "a")
     ,@(--map-indexed
        (list 'string (intern (format ":chat-%s" it-index))
              (concat (propertize (concat (car it) "\n") 'face 'lens-chat-user) "\n"
@@ -49,8 +51,8 @@
                      (propertize "\n" 'face '(lens-chat-ai lens-chat-footer))))
        (reverse history))
 
-    (text-field :input ,input ,set-input :props ,field-props)
-    ;; (text-field :input ,input ,set-input :onenter ,send-cb :width 50)
+    ;; (text-field :input ,input ,set-input :props ,field-props :focus ,field-focus-id)
+    (text-box :input ,input ,set-input :onenter ,send-cb :width 50)
     (button :send "Send" ,send-cb)))
 
 

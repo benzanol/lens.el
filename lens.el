@@ -1104,9 +1104,9 @@ Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
 This is for the purpose of calculating diffs between ui states."
   (let ((content (plist-get state :content)))
     (cons (cl-loop for hook in (plist-get state :hooks)
-                   when (or (eq (car hook) :use-state)
-                            (eq (car hook) :use-buffer-state))
-                   collect (cadr hook))
+                   nconc (pcase (car hook)
+                           ((or :use-state :use-buffer-state :use-focusable)
+                            (list (cadr hook)))))
           (when (listp content)
             (--map (lens--ui-nested-rerender-hooks (cdr it)) content)))))
 
@@ -1128,15 +1128,9 @@ This format is designed to be suitable for diffing, as used in
       (--mapcat (lens--ui-string-rows (cdr it) (append key-path (list (car it))))
                 content))))
 
-(defun lens--ui-renderer (state old-rows he fb)
+(defun lens--ui-renderer (state old-rows he _fb)
   (let* ((new-rows (lens--ui-string-rows state nil))
-         (diff (lens--ui-diff old-rows new-rows))
-         ;; Keep a hash map from key paths to (start . end) positions
-         (key-path-to-posns (make-hash-table :test #'equal :size (* 2 (length new-rows))))
-         (last-key-path nil))
-
-    ;; Add the root position
-    (puthash nil (cons (1+ he) fb) key-path-to-posns)
+         (diff (lens--ui-diff old-rows new-rows)))
 
     (lens-save-position-in-ui
      (goto-char (1+ he))
@@ -1153,35 +1147,70 @@ This format is designed to be suitable for diffing, as used in
              (setq match (text-property-search-forward 'lens-element-key))
              (cl-assert match)
              (cl-assert (equal (prop-match-value match) key-path))
-             (when (eq action :delete) (delete-region start (point)))))
-
-         ;; Record the positions of the element
-         (unless (eq action :delete)
-           ;; We need to record the start position for all parent key
-           ;; paths that are new since the last-key-path
-           (dolist (i (number-sequence 1 (length key-path)))
-             (let ((sub-path (-slice key-path 0 i)))
-               (unless (equal sub-path (-slice last-key-path 0 i))
-                 (puthash sub-path (cons start nil) key-path-to-posns))))
-           ;; We need to record the end position for all key paths
-           ;; that are parents of last-key-path, but not key-path
-           (dolist (i (number-sequence 1 (length last-key-path)))
-             (let ((sub-path (-slice last-key-path 0 i)))
-               (unless (equal sub-path (-slice key-path 0 i))
-                 (setcdr (gethash sub-path key-path-to-posns) start))))
-
-           ;; Update last-key-path
-           (setq last-key-path key-path)))))
+             (when (eq action :delete) (delete-region start (point))))))))
 
     (run-with-timer
      0.07 nil
      #'(lambda (buf)
          (with-current-buffer buf
            (remove-overlays nil nil 'face 'lens-rerender-highlight)))
-     (current-buffer))
+     (current-buffer))))
 
-    ;; Run any use effect callbacks
-    (lens--ui-run-effects state key-path-to-posns)))
+
+;;;; Finding things
+
+(defun lens--ui-find-region (state)
+  "Go to and return the region associated with STATE, or error."
+  (set-buffer (plist-get state :buffer))
+  (goto-char (point-min))
+
+  (or (text-property-search-forward
+       'lens-begin state
+       #'(lambda (st lens) (eq st (car (caddr lens)))))
+      (error "Lens not found"))
+
+  (let ((region (lens-at-point)))
+    (or (eq state (car (caddr (car region))))
+        (error "Incorrect lens found"))
+    region))
+
+(defun lens--ui-find-element (state key-path)
+  "Go to and return the element associated with KEY-PATH.
+
+This will first find the lens associated with state STATE, and then find
+the corresponding element within that lens."
+  (let* ((region (lens--ui-find-region state))
+         (hb (nth 1 region))
+         (fe (nth 4 region)))
+    (save-restriction
+      (goto-char fe)
+      (narrow-to-region hb fe)
+      ;; This will get to the newline at the very end of the element
+      (or (text-property-search-backward
+           'lens-element-key
+           key-path
+           #'(lambda (target found)
+               ;; Checks if `found' starts with `target'
+               (and (listp found)
+                    (cl-search target found :end2 (length target)))))
+          (error "Element end not found: %s" key-path))
+      (forward-char -1)
+      (let ((end (point)))
+        (or (text-property-search-backward
+             'lens-element-key
+             key-path
+             #'(lambda (target found)
+                 ;; Checks if `found' starts with `target'
+                 (and found
+                      (not (and (listp found)
+                                (cl-search target found :end2 (length target)))))))
+            (error "Element start not found: %s" key-path))
+        (forward-char 1)
+        (cons (point) end)))))
+
+(defun lens--ui-find-ctx-element (ctx)
+  "Wrapper for `lens--ui-find-element' using a ctx object."
+  (lens--ui-find-element (plist-get ctx :root-state) (plist-get ctx :path)))
 
 
 ;;;; Generating uis
@@ -1267,6 +1296,125 @@ Creates an intermediate ui-generation context which is a plist containing:
      hook))
 
 
+;;;; Use focusable
+
+(defvar-local lens-ui-focused nil
+  "The currently focused element in the current buffer.
+
+This is nil, or a plist with the following properties:
+:element - A unique id for the focusable element (compared using
+equal)
+:info - Additional info provided by the focused element
+:last-point - The position of the cursor after the previous command
+:update - Called after every command. If it returns nil, then unfocus
+the element (uncontrolled).
+:on-focus - Function called when focusing
+:on-unfocus - Function called when unfocusing")
+
+(defun lens--focused-post-command ()
+  (if (null lens-ui-focused) (lens-ui-unfocus)
+
+    (let ((stay-focused (funcall (plist-get lens-ui-focused :update) lens-ui-focused)))
+      (if stay-focused
+          (plist-put lens-ui-focused :last-point (point))
+
+        (lens-ui-unfocus)))))
+
+(cl-defun lens--use-focusable (&rest plist)
+  "Store a memoized value."
+  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
+         hook)
+
+    ;; Ensure that there are no other :use-focusable hooks
+    (and (plist-get ctx :is-first-call)
+         (--any (eq (car it) :use-focusable) (plist-get (plist-get ctx :state) :hooks)))
+
+    (setq hook (lens--register-hook ctx :use-focusable nil))
+    (setf (cddr hook) plist)
+
+    ;; Set the first argument to be whether it is focused
+    (setf (cadr hook)
+          (when lens-ui-focused
+            (let ((elem (plist-get lens-ui-focused :element)))
+              (and (eq (car elem) (plist-get ctx :root-state))
+                   (equal (cdr elem) (plist-get ctx :path))))))
+    (cadr hook)))
+
+(defun lens-ui-unfocus ()
+  "Unfocus the focused element."
+  (interactive)
+  (let ((old lens-ui-focused))
+    (setq lens-ui-focused nil)
+    (remove-hook 'post-command-hook #'lens--focused-post-command t)
+
+    (when old
+      (lens--perform-callback-internal
+       (car (plist-get old :element))
+       (lambda ()
+         (ignore-errors
+           (funcall (or (plist-get old :on-unfocus) #'ignore)
+                    lens-ui-focused)))
+       nil))))
+
+(defun lens-ui-focus (ctx &rest relative-path)
+  (let* ((path (append (plist-get ctx :path) relative-path))
+         (elem-state (or (lens--follow-key-path (plist-get ctx :state) relative-path)
+                         (error "Unable to focus element %s: Not found" path)))
+         (hook (or (--find (eq (car it) :use-focusable) (plist-get elem-state :hooks))
+                   (error "Unable to focus element %s: Not focusable" path)))
+         (plist (cddr hook))
+         (element (cons (plist-get ctx :root-state) path))
+         (old-focused lens-ui-focused)
+         (old-element (plist-get old-focused :element))
+         (new-focused (list :element element
+                            :last-point (point)
+                            :update (plist-get plist :update)
+                            :info (plist-get plist :info)
+                            :on-focus (plist-get plist :on-focus)
+                            :on-unfocus (plist-get plist :on-unfocus))))
+
+    (add-hook 'post-command-hook #'lens--focused-post-command nil t)
+
+    (setq lens-ui-focused new-focused)
+
+    (cond
+     ;; old state != new state
+     ((not (eq (car element) (car old-element)))
+      ;; First, unfocus the old
+      (when old-element
+        (lens--perform-callback-internal
+         (car old-element)
+         (lambda ()
+           (with-demoted-errors "Error in on-unfocus: %s"
+             (funcall (or (plist-get old-focused :on-unfocus) #'ignore)
+                      lens-ui-focused)))
+         nil))
+
+      ;; Then, focus the new
+      (lens--perform-callback-internal
+       (car element)
+       (lambda ()
+         (with-demoted-errors "Error in on-focus: %s"
+           (funcall (or (plist-get new-focused :on-focus) #'ignore)
+                    lens-ui-focused)))
+       nil))
+
+     ;; old path = new path (do nothing)
+     ((equal (cdr element) (cdr old-element)))
+
+     ;; different path in same state
+     (t
+      (lens--perform-callback-internal
+       (car element)
+       (lambda ()
+         (with-demoted-errors "Error in on-unfocus: %s"
+           (funcall (or (plist-get old-focused :on-unfocus) #'ignore) lens-ui-focused))
+         (setq lens-ui-focused new-focused)
+         (ignore-errors
+           (funcall (or (plist-get new-focused :on-focus) #'ignore) lens-ui-focused)))
+       nil)))))
+
+
 ;;;; Use callback
 
 (defvar lens--callback-state nil
@@ -1306,25 +1454,12 @@ hook. This function returns SYMBOL."
          (error "Invalid component key path"))
      (cdr path))))
 
-(defun lens--perform-callback (state path name args)
-  "Perform a named callback.
+(defun lens--perform-callback-internal (state callback args)
+  (if lens--callback-state
+      (apply callback args)
 
-STATE is the root ui state. PATH is the path to the component containing
-the callback. NAME is the name of the callback."
-
-  ;; Find the correct function to call
-  (let* ((nested-state (lens--follow-key-path state path))
-         (hook (or (--find (and (eq (car it) :use-callback)
-                                (eq (cadr it) name))
-                           (plist-get nested-state :hooks))
-                   (error "Callback not found %s %s" path name)))
-         region old-rows)
-
-    ;; If this is a callback called from within another callback
-    (if lens--callback-state
-        (apply (caddr hook) args)
-
-      ;; This is the root-level callback, so we need to handle updating the lens
+    ;; This is the root-level callback, so we need to handle updating the lens
+    (let (old-rows region)
       (with-current-buffer (plist-get state :buffer)
         (save-excursion
           (goto-char (point-min))
@@ -1349,13 +1484,34 @@ the callback. NAME is the name of the callback."
                              state state))
 
         (let ((lens--callback-state state))
-          (apply (caddr hook) args))
+          (apply callback args))
 
         (lens--generate-ui (plist-get state :ui-func) nil
                            state state)
 
         (lens-modify region (cons state (lens--collect-buffer-states state nil)) nil
-                     (lambda (he fb) (lens--ui-renderer state old-rows he fb)))))))
+                     (lambda (he fb) (lens--ui-renderer state old-rows he fb)))
+
+        (lens--ui-run-effects state)
+
+        (when lens-ui-focused
+          (plist-put lens-ui-focused :last-point (point)))))))
+
+(defun lens--perform-callback (state path name args)
+  "Perform a named callback.
+
+STATE is the root ui state. PATH is the path to the component containing
+the callback. NAME is the name of the callback."
+
+  ;; Find the correct function to call
+  (let* ((nested-state (lens--follow-key-path state path))
+         (hook (or (--find (and (eq (car it) :use-callback)
+                                (eq (cadr it) name))
+                           (plist-get nested-state :hooks))
+                   (error "Callback not found %s %s" path name))))
+
+    ;; If this is a callback called from within another callback
+    (lens--perform-callback-internal state (caddr hook) args)))
 
 
 ;;;; Use state
@@ -1427,25 +1583,18 @@ Returns a cons of (VALUE . SETTER-FUNCTION)."
 
 ;;;; Use effect
 
-(defun lens--ui-run-effects (state path-to-posn &optional key-path)
+(defun lens--ui-run-effects (state &optional key-path)
   "Run all pending use-effect hooks in STATE and its children.
 
-PATH-TO-POSN is a hash table mapping key paths to buffer positions.
 KEY-PATH is the current path in the component tree."
-  (let ((posn (when (plist-get state :hooks)
-                ;; Find the first parent of key-path which has a position
-                (or (cl-loop for i downfrom (length key-path)
-                             thereis (gethash (-slice key-path 0 i) path-to-posn))
-                    (error "No position found for effect: %s" key-path)))))
-    (dolist (hook (plist-get state :hooks))
-      (when (and (eq (car hook) :use-effect)
-                 (nth 3 hook))
-        (funcall (cadr hook) (car posn) (cdr posn))))
-    (let ((children (plist-get state :content)))
-      (when (listp children)
-        (dolist (child children)
-          (lens--ui-run-effects (cdr child) path-to-posn
-                                (append key-path (list (car child)))))))))
+  (let ((children (plist-get state :content)))
+    (when (listp children)
+      (dolist (child children)
+        (lens--ui-run-effects (cdr child) (append key-path (list (car child)))))))
+  (dolist (hook (plist-get state :hooks))
+    (when (and (eq (car hook) :use-effect)
+               (nth 3 hook))
+      (funcall (cadr hook)))))
 
 (defun lens--use-effect (dependencies effect)
   "Define a use-effect hook.
@@ -1458,7 +1607,7 @@ The 3rd parameter is t if this is the first render, or if the
 dependencies changed since the last render."
   (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
          (hook (lens--register-hook ctx :use-effect
-                 effect dependencies t)))
+                 effect (not dependencies) t)))
 
     ;; Set the callback to the new callback
     (setf (cadr hook) effect)
@@ -1494,21 +1643,26 @@ be rerun when one of DEPENDENCIES changes."
 
 (defun lens--use-text-properties (properties)
   "Set additional text properties for the entire region."
-  (lens--use-effect
-   (random)
-   (lambda (start end)
-     (message "S %s E %s" start end)
-     (let ((ps properties) prop value)
-       (while ps
-         (setq prop (pop ps) value (pop ps))
-         (pcase prop
-           ('face (add-face-text-property start end value t))
-           ('keymap
-            (alter-text-property
-             start end 'keymap
-             (lambda (existing)
-               (if existing (list 'keymap existing value)))))
-           (_ (put-text-property start end prop value))))))))
+  (let ((ctx (or lens--current-ctx (error "No containing lens context"))))
+    (lens--use-effect
+     (random)
+     (lambda ()
+       (save-excursion
+         (pcase-let ((`(,start . ,end) (lens--ui-find-ctx-element ctx))
+                     (ps properties)
+                     (prop nil) (value nil))
+           (message "TXT PROPS %s %s %s" start end ps)
+           (lens-silent-edit
+            (while ps
+              (setq prop (pop ps) value (pop ps))
+              (pcase prop
+                ('face (add-face-text-property start end value t))
+                ('keymap
+                 (alter-text-property
+                  start end 'keymap
+                  (lambda (existing)
+                    (if existing (list 'keymap existing value) value))))
+                (_ (put-text-property start end prop value)))))))))))
 
 
 ;;;; Ui display
@@ -1565,6 +1719,7 @@ hook among all hooks in the current component."
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
+            (run-with-timer 0 nil #'lens--ui-run-effects (car state))
             (concat (propertize "\n" 'lens-element-key 'START)
                     (lens--ui-state-to-string (car state)))))))
 
@@ -1609,7 +1764,11 @@ hook among all hooks in the current component."
      (:use-renderer
       lambda (body ctx renderer)
       (let ((ctx-expr '(or lens--current-ctx (error "No containing lens context"))))
-        (cons `(plist-put (plist-get ,ctx-expr :state) :renderer ,renderer) body)))]
+        (cons `(plist-put (plist-get ,ctx-expr :state) :renderer ,renderer) body)))
+     (:use-focusable
+      lambda (body var &rest plist)
+      `((let ((,var (lens--use-focusable ,@plist)))
+          ,@body)))]
     ,@body))
 
 (defmacro lens-defui (name arglist &rest body)
@@ -1732,6 +1891,71 @@ string to insert between the columns."
 
 ;;;; Text box
 
+(lens-defcomponent text-box (ctx text set-text &key onenter width)
+  :can-be-column t
+
+  (:use-state cursor set-cursor nil)
+
+  (:use-state unique-id _set-unique-id (random))
+  (:use-focusable focused? :info (list unique-id) :update #'lens--border-box-update-cursor
+                  :on-focus (lambda (_) (run-hook-with-args 'lens-box-enter-hook))
+                  :on-unfocus (lambda (_) (run-hook-with-args 'lens-box-exit-hook)))
+
+  ;; The real value to use for the cursor
+  (setq cursor (when focused? (min (or cursor (length text)) (length text))))
+
+  (:let border-face 'lens-field-header)
+
+  (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
+              (lens--textbox-wrap
+               text :width (or width 30)
+               :cursor cursor
+               :box-props `(lens-textbox-border t read-only t face ,border-face)
+               :title (if focused? "Esc to unfocus" "Enter to focus")
+               :charset 'unicode))
+
+  (:use-callback focus () (lens-ui-focus ctx))
+  (:use-callback unfocus () (lens-ui-unfocus))
+
+  ;; Update the cursor at the end
+  (:use-effect
+   (when focused? (list cursor-line cursor-col))
+   (lambda ()
+     (when (and focused? cursor-line cursor-col)
+       (lens--ui-find-ctx-element ctx)
+       (forward-line (1+ cursor-line))
+       (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+       (forward-char cursor-col))))
+
+  (:use-callback
+    change-cb (newtext newcursor line-idx)
+    (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
+      (funcall set-text (car res))
+      (set-cursor (cdr res))))
+
+  (:use-text-properties
+   'keymap
+   (if focused? `(keymap (escape . ,unfocus) (return . ,onenter))
+     `(keymap (return . ,focus))))
+
+  (string-join
+   (nconc (list (substring header 0 -1))
+          (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
+                   for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
+                                              'read-only (eq line-idx 0))
+                   for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
+                   collect
+                   (lens--field
+                    (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
+                    (let ((scoped-line-idx line-idx))
+                      (lambda (newtext newcursor)
+                        (funcall change-cb newtext newcursor scoped-line-idx)))
+                    (substring prefix 0 -1)
+                    (substring suffix 1 -1)
+                    (unless focused? (list 'face border-face 'read-only t))))
+          (list footer))
+   (propertize "\n" 'read-only t)))
+
 (defcustom lens-box-enter-hook nil
   "Hook run after entering a box."
   :group 'lens
@@ -1742,118 +1966,33 @@ string to insert between the columns."
   :group 'lens
   :type 'hook)
 
-(defvar-local lens--focused-border-box nil
-  "The focused border box in the current buffer, or nil.")
+(cl-defun lens--border-box-update-cursor ((&key info last-point &allow-other-keys))
+  (let ((cur-line (line-number-at-pos))
+        (unique-id (car info)))
 
-(lens-defcomponent text-box (_ctx text set-text &key onenter width)
-  :can-be-column t
-
-  (:use-state cursor set-cursor nil)
-  (:use-state unique-id _set-unique-id (abs (random)))
-  (setq cursor (when cursor (min cursor (length text))))
-
-  (:let border-face 'lens-field-header)
-
-  (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
-              (lens--textbox-wrap
-               text :width (or width 30)
-               :cursor cursor
-               :box-props `(lens-textbox-border t read-only t face ,border-face)
-               :title (if cursor "Esc to unfocus" "Enter to focus")
-               :charset 'unicode))
-
-  (:use-callback
-    focus ()
-    (set-cursor (length text))
-    (setq lens--focused-border-box (list :unique-id unique-id :last-point (point)))
-    (add-hook 'post-command-hook #'lens--border-box-fix-cursor nil 'local))
-
-  (:use-callback
-    unfocus ()
-    (set-cursor nil)
-    (setq lens--focused-border-box nil)
-    (remove-hook 'post-command-hook #'lens--border-box-fix-cursor t))
-
-  (when lens--focused-border-box
-    (plist-put lens--focused-border-box :unfocus unfocus))
-
-  (:let map (if cursor
-                `(keymap (escape . ,unfocus) (return . ,onenter))
-              `(keymap (return . ,focus))))
-
-  ;; Run the hooks when focus changes
-  (:use-effect
-   (not cursor)
-   (lambda (_ _) (run-hook-with-args (if cursor 'lens-box-enter-hook 'lens-box-exit-hook))))
-
-  ;; Update the cursor at the end
-  (:use-effect
-   (list cursor-line cursor-col)
-   (lambda (start _end)
-     (when (and cursor-line cursor-col lens--focused-border-box)
-       (goto-char start)
-       (forward-line (1+ cursor-line))
-       (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-       (forward-char cursor-col)
-       (plist-put lens--focused-border-box :last-point (point)))))
-
-  (:use-callback
-    change-cb (newtext newcursor line-idx)
-    (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
-      (funcall set-text (car res))
-      (set-cursor (cdr res))))
-
-  (propertize
-   (string-join
-    (nconc (list (substring header 0 -1))
-           (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
-                    for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
-                                               'read-only (eq line-idx 0))
-                    for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
-                    collect
-                    (lens--field
-                     (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
-                     (let ((scoped-line-idx line-idx))
-                       (lambda (newtext newcursor)
-                         (funcall change-cb newtext newcursor scoped-line-idx)))
-                     (substring prefix 0 -1)
-                     (substring suffix 1 -1)
-                     (unless cursor (list 'face border-face 'read-only t))))
-           (list footer))
-    (propertize "\n" 'read-only t))
-   'keymap map))
-
-(defun lens--border-box-fix-cursor ()
-  "When a box is active, this set as a local `post-command-hook'."
-  (when lens--focused-border-box
-    (-let (((&plist :last-point prev-pos :unique-id unique-id) lens--focused-border-box)
-           (cur-line (line-number-at-pos)))
-      (or (eq prev-pos (point))
-          (eq (get-text-property (point) 'lens-border-box-content) unique-id)
-          ;; Do not run if a modification was made
-          (memq #'lens--field-modification-callback (default-value 'post-command-hook))
-          ;; If we moved horizontally off of the line, go to the previous/next line
-          (if (eq cur-line (line-number-at-pos prev-pos))
-              (if (< (point) prev-pos)
-                  (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-                (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-                    ;; The cursor is allowed to be at the end of the last line
-                    (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
-            ;; If we moved to a different line, try to find the end of the line
-            (goto-char (pos-eol))
-            (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-                 ;; If we went off the end of the textbox
-                 (eq cur-line (line-number-at-pos))))
-          ;; If everything else failed, go back to the last known position
-          (if (eq (or (get-text-property prev-pos 'lens-border-box-content)
-                      (get-text-property prev-pos 'lens-border-box-eol))
+    (or (eq last-point (point))
+        (eq (get-text-property (point) 'lens-border-box-content) unique-id)
+        ;; Do not run if a modification was made
+        (memq #'lens--field-modification-callback (default-value 'post-command-hook))
+        ;; If we moved horizontally off of the line, go to the previous/next line
+        (if (eq cur-line (line-number-at-pos last-point))
+            (if (< (point) last-point)
+                (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+              (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+                  ;; The cursor is allowed to be at the end of the last line
+                  (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
+          ;; If we moved to a different line, try to find the end of the line
+          (goto-char (pos-eol))
+          (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
+               ;; If we went off the end of the textbox
+               (eq cur-line (line-number-at-pos))))
+        ;; If everything else failed, go back to the last known position
+        (when (eq (or (get-text-property last-point 'lens-border-box-content)
+                      (get-text-property last-point 'lens-border-box-eol))
                   unique-id)
-              (progn (goto-char prev-pos)
-                     (message "Press ESC to exit the textbox"))
-            (funcall (plist-get lens--focused-border-box :unfocus))))
-
-      (when lens--focused-border-box
-        (plist-put lens--focused-border-box :last-point (point))))))
+          (goto-char last-point)
+          (message "Press ESC to exit the textbox")
+          t))))
 
 (defun lens--border-box-callback (body line-idx new-line-text cursor-col)
   "Process a modification to a border box.
