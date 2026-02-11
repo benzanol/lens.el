@@ -1301,33 +1301,52 @@ Creates an intermediate ui-generation context which is a plist containing:
 (defvar-local lens-ui-focused nil
   "The currently focused element in the current buffer.
 
-This is nil, or a plist with the following properties:
-:element - A unique id for the focusable element (compared using
-equal)
-:info - Additional info provided by the focused element
-:last-point - The position of the cursor after the previous command
-:update - Called after every command. If it returns nil, then unfocus
-the element (uncontrolled).
-:on-focus - Function called when focusing
-:on-unfocus - Function called when unfocusing")
+This is nil, or a plist representing the current focused element.
+
+The plist has the following internally managed properties:
+  :element - A cons cell (STATE . PATH) representing the current element.
+  :last-point - The position of the cursor after the previous command.
+  :location - A cons cell (START . END) representing the last known
+    start end end position of the focused element.
+
+It also can have any of the following properties specified by the
+use-focusable hook:
+  :update - A function called every time the cursor moves while the
+    element is focused. If it returns nil, then unfocus the element. If
+    this property is omited, then the element will be immediately
+    unfocused every time it is focused.
+  :on-focus - Function called when focusing.
+  :on-unfocus - Function called when unfocusing.
+  :render - If non-nil, rerender the element when focused/unfocused.
+
+All functions are called with one argument, which is the value of
+`lens-ui-focused'.")
 
 (defun lens--focused-post-command ()
   (if (null lens-ui-focused) (lens-ui-unfocus)
 
-    (let ((stay-focused (funcall (plist-get lens-ui-focused :update) lens-ui-focused)))
-      (if stay-focused
-          (plist-put lens-ui-focused :last-point (point))
-
-        (lens-ui-unfocus)))))
+    (let ((element (plist-get lens-ui-focused :element)))
+      (plist-put lens-ui-focused :location
+                 (lens--ui-find-element (car element) (cdr element)))
+      (let* ((fn (or (plist-get lens-ui-focused :update) #'ignore))
+             (stay-focused (with-demoted-errors "Error fixing focus: %s"
+                             (funcall fn lens-ui-focused))))
+        (if stay-focused
+            (plist-put lens-ui-focused :last-point (point))
+          (lens-ui-unfocus))))))
 
 (cl-defun lens--use-focusable (&rest plist)
-  "Store a memoized value."
+  "Make the current element focusable.
+
+See `lens-ui-focused' for a list of valid properties for PLIST."
+
   (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
          hook)
 
     ;; Ensure that there are no other :use-focusable hooks
     (and (plist-get ctx :is-first-call)
-         (--any (eq (car it) :use-focusable) (plist-get (plist-get ctx :state) :hooks)))
+         (--any (eq (car it) :use-focusable) (plist-get (plist-get ctx :state) :hooks))
+         (error "You can only have one :use-focusable hook per element"))
 
     (setq hook (lens--register-hook ctx :use-focusable nil))
     (setf (cddr hook) plist)
@@ -1340,23 +1359,33 @@ the element (uncontrolled).
                    (equal (cdr elem) (plist-get ctx :path))))))
     (cadr hook)))
 
+(defun lens--perform-focus-change (element focus unfocus)
+  (let ((fn #'(lambda (focus unfocus)
+                (when-let ((on-focus (plist-get focus :on-focus)))
+                  (with-demoted-errors "Error in focus: %s"
+                    (funcall on-focus focus)))
+                (when-let ((on-unfocus (plist-get unfocus :on-unfocus)))
+                  (with-demoted-errors "Error in unfocus: %s"
+                    (funcall on-unfocus unfocus))))))
+
+    (if (or (plist-get focus :render) (plist-get unfocus :render))
+        (lens--perform-callback-internal (car element) fn (list focus unfocus))
+      (funcall fn focus unfocus))))
+
 (defun lens-ui-unfocus ()
   "Unfocus the focused element."
   (interactive)
   (let ((old lens-ui-focused))
     (setq lens-ui-focused nil)
     (remove-hook 'post-command-hook #'lens--focused-post-command t)
-
-    (when old
-      (lens--perform-callback-internal
-       (car (plist-get old :element))
-       (lambda ()
-         (ignore-errors
-           (funcall (or (plist-get old :on-unfocus) #'ignore)
-                    lens-ui-focused)))
-       nil))))
+    (when old (lens--perform-focus-change (plist-get old :element) nil old))))
 
 (defun lens-ui-focus (ctx &rest relative-path)
+  "Focus the element at RELATIVE-PATH relative to CTX.
+
+For example, if RELATIVE-PATH is nil, this will focus the current
+element. If RELATIVE-PATH is (:a) it will focus the child with key :a.
+The element being focused must have a :use-focusable hook."
   (let* ((path (append (plist-get ctx :path) relative-path))
          (elem-state (or (lens--follow-key-path (plist-get ctx :state) relative-path)
                          (error "Unable to focus element %s: Not found" path)))
@@ -1366,53 +1395,27 @@ the element (uncontrolled).
          (element (cons (plist-get ctx :root-state) path))
          (old-focused lens-ui-focused)
          (old-element (plist-get old-focused :element))
-         (new-focused (list :element element
-                            :last-point (point)
-                            :update (plist-get plist :update)
-                            :info (plist-get plist :info)
-                            :on-focus (plist-get plist :on-focus)
-                            :on-unfocus (plist-get plist :on-unfocus))))
+         new-focused)
 
-    (add-hook 'post-command-hook #'lens--focused-post-command nil t)
+    (unless (equal element old-element)
+      (setq new-focused
+            (apply #'list
+                   :element element
+                   :last-point (point)
+                   :location (lens--ui-find-element (car element) (cdr element))
+                   plist))
 
-    (setq lens-ui-focused new-focused)
+      (setq lens-ui-focused (when (plist-get plist :update) new-focused))
+      (if lens-ui-focused
+          (add-hook 'post-command-hook #'lens--focused-post-command nil t)
+        (remove-hook 'post-command-hook #'lens--focused-post-command t))
 
-    (cond
-     ;; old state != new state
-     ((not (eq (car element) (car old-element)))
-      ;; First, unfocus the old
-      (when old-element
-        (lens--perform-callback-internal
-         (car old-element)
-         (lambda ()
-           (with-demoted-errors "Error in on-unfocus: %s"
-             (funcall (or (plist-get old-focused :on-unfocus) #'ignore)
-                      lens-ui-focused)))
-         nil))
-
-      ;; Then, focus the new
-      (lens--perform-callback-internal
-       (car element)
-       (lambda ()
-         (with-demoted-errors "Error in on-focus: %s"
-           (funcall (or (plist-get new-focused :on-focus) #'ignore)
-                    lens-ui-focused)))
-       nil))
-
-     ;; old path = new path (do nothing)
-     ((equal (cdr element) (cdr old-element)))
-
-     ;; different path in same state
-     (t
-      (lens--perform-callback-internal
-       (car element)
-       (lambda ()
-         (with-demoted-errors "Error in on-unfocus: %s"
-           (funcall (or (plist-get old-focused :on-unfocus) #'ignore) lens-ui-focused))
-         (setq lens-ui-focused new-focused)
-         (ignore-errors
-           (funcall (or (plist-get new-focused :on-focus) #'ignore) lens-ui-focused)))
-       nil)))))
+      (if (eq (car element) (car old-element))
+          ;; different path in same state -- perform a single focus change for both
+          (lens--perform-focus-change element new-focused old-focused)
+        ;; old state != new state -- perform an unfocus then a focus
+        (when old-element (lens--perform-focus-change old-element nil old-focused))
+        (lens--perform-focus-change element new-focused nil)))))
 
 
 ;;;; Use callback
@@ -1437,7 +1440,7 @@ hook. This function returns SYMBOL."
             name cb
             (let* ((str (cl-loop for sym in path
                                  concat (symbol-name sym) into str
-                                 finally return (format "lens-%s%s!%s" ui-id str name)))
+                                 finally return (format "lens-%s%s:%s" ui-id str name)))
                    (ret-symbol (make-symbol str)))
               (fset ret-symbol
                     `(lambda (&rest args)
@@ -1587,16 +1590,16 @@ Returns a cons of (VALUE . SETTER-FUNCTION)."
   "Run all pending use-effect hooks in STATE and its children.
 
 KEY-PATH is the current path in the component tree."
-  ;; Run effects for the current element
-  (dolist (hook (plist-get state :hooks))
-    (when (and (eq (car hook) :use-effect)
-               (nth 3 hook))
-      (funcall (cadr hook))))
   ;; Run effects for sub elements
   (let ((children (plist-get state :content)))
     (when (listp children)
       (dolist (child children)
-        (lens--ui-run-effects (cdr child) (append key-path (list (car child))))))))
+        (lens--ui-run-effects (cdr child) (append key-path (list (car child)))))))
+  ;; Run effects for the current element
+  (dolist (hook (plist-get state :hooks))
+    (when (and (eq (car hook) :use-effect)
+               (nth 3 hook))
+      (funcall (cadr hook)))))
 
 (defun lens--use-effect (dependencies effect)
   "Define a use-effect hook.
@@ -1666,9 +1669,9 @@ be rerun when one of DEPENDENCIES changes."
                     (cond ((or (eq existing value) (memq value (cdr existing))) existing)
                           ;; If the existing is already a list of keymaps, prepend
                           ((and (keymapp existing) (ignore-errors (-every #'keymapp (cdr existing))))
-                           (apply #'list 'keymap value (cdr existing)))
+                           `(keymap ,@(cdr existing) value))
                           ;; If there is already a keymap, create one combining the two
-                          (existing (list 'keymap value existing))
+                          (existing (list 'keymap existing value))
                           (value)))))
                 (_ (put-text-property start end prop value)))))))))))
 
@@ -1740,11 +1743,15 @@ hook among all hooks in the current component."
   `(lens-let-body
     [(:use-callback
        lambda (body name &rest cb)
+       (when (and (> (length cb) 1) (not (and (listp (car cb)) (-every #'symbolp (car cb)))))
+         (error "If :use-callback has more than 2 arguments, the second must be an argument list"))
        `((let* ((cb ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))
                 (,name (lens--use-callback ',name cb)))
            ,@body)))
      (:use-state
       lambda (body state-var set-var initial)
+      (unless (symbolp state-var) (error "First argument to :use-state must be a variable symbol"))
+      (unless (symbolp set-var) (error "Second argument to :use-state must be a function symbol"))
       `((let* ((=use-state= (lens--use-state ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
@@ -1752,18 +1759,23 @@ hook among all hooks in the current component."
             ,@body))))
      (:use-buffer-state
       lambda (body state-var set-var initial)
+      (unless (symbolp state-var) (error "First argument to :use-buffer-state must be a variable symbol"))
+      (unless (symbolp set-var) (error "Second argument to :use-buffer-state must be a function symbol"))
       `((let* ((=use-state= (lens--use-buffer-state ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
             ,@body))))
      (:use-memo
-      lambda (body var dependencies &rest cb)
-      `((let ((,var (lens--use-memo ,dependencies ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))))
+      lambda (body var deps &rest cb-body)
+      (unless (symbolp var) (error "First argument to :use-memo must be a variable symbol"))
+      (unless (vectorp deps) (error "Second argument to :use-memo must be a dependency vector"))
+      `((let ((,var (lens--use-memo (list ,@deps ,@nil) (lambda (,var) (ignore ,var) ,@cb-body))))
           ,@body)))
      (:use-effect
-      lambda (body dependencies &rest cb)
-      `((lens--use-effect ,dependencies ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))
+      lambda (body deps &rest cb-body)
+      (unless (vectorp deps) (error "First argument to :use-effect must be a dependency vector"))
+      `((lens--use-effect (list ,@deps ,@nil) (lambda () ,@cb-body))
         ,@body))
      (:use-text-properties
       lambda (body &rest properties)
@@ -1885,14 +1897,18 @@ string to insert between the columns."
 
 ;;;; Text field
 
-(lens-defcomponent text-field (_ctx text set-text &key header footer props focus)
+(lens-defcomponent text-field (_ctx text set-text &key header footer props)
   (:use-callback onchange (newtext _newcursor)
                  (funcall set-text newtext))
 
   (setq header (propertize (or header "[begin field]\n") 'face 'lens-field-header))
-  (setq footer (propertize (or footer "\n[end field]") 'face 'lens-field-header))
+  (setq footer (apply #'propertize (or footer "\n[end field]") 'face 'lens-field-header props))
 
-  (:use-effect focus (_start end) (when focus (goto-char (- end (length footer) 1))))
+  (:use-focusable _focused?
+                  :on-focus
+                  #'(lambda (ps)
+                      (goto-char (- (cdr (plist-get ps :location))
+                                    (length footer) -1))))
 
   (lens--field text onchange header footer props))
 
@@ -1905,7 +1921,10 @@ string to insert between the columns."
   (:use-state cursor set-cursor nil)
 
   (:use-state unique-id _set-unique-id (random))
-  (:use-focusable focused? :info (list unique-id) :update #'lens--border-box-update-cursor
+  (:use-focusable focused?
+                  :render t
+                  :info (list unique-id)
+                  :update #'lens--border-box-update-cursor
                   :on-focus (lambda (_) (run-hook-with-args 'lens-box-enter-hook))
                   :on-unfocus (lambda (_) (run-hook-with-args 'lens-box-exit-hook)))
 
@@ -1927,13 +1946,12 @@ string to insert between the columns."
 
   ;; Update the cursor at the end
   (:use-effect
-   (when focused? (list cursor-line cursor-col))
-   (lambda ()
-     (when (and focused? cursor-line cursor-col)
-       (lens--ui-find-ctx-element ctx)
-       (forward-line (1+ cursor-line))
-       (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-       (forward-char cursor-col))))
+   [focused? cursor-line cursor-col]
+   (when (and focused? cursor-line cursor-col)
+     (lens--ui-find-ctx-element ctx)
+     (forward-line (1+ cursor-line))
+     (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
+     (forward-char cursor-col)))
 
   (:use-callback
     change-cb (newtext newcursor line-idx)
@@ -1941,8 +1959,8 @@ string to insert between the columns."
       (funcall set-text (car res))
       (set-cursor (cdr res))))
 
-  (:use-memo focused-map nil (lambda (_) `(keymap (escape . ,unfocus) (return . ,onenter))))
-  (:use-memo unfocused-map nil (lambda (_) `(keymap (return . ,focus))))
+  (:use-memo focused-map [onenter] `(keymap (escape . ,unfocus) (return . ,onenter)))
+  (:use-memo unfocused-map [] `(keymap (return . ,focus)))
   (:use-text-properties 'keymap (if focused? focused-map unfocused-map))
 
   (string-join

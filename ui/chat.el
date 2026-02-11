@@ -37,10 +37,10 @@
       0.05)))
 
   (:use-callback focus-field () (lens-ui-focus ctx :input))
-  (:use-memo keymap nil (lambda (_) `(keymap (return . ,focus-field))))
+  (:use-memo keymap [] `(keymap (return . ,focus-field)))
   (:use-text-properties 'keymap keymap)
 
-  (:let field-props `(keymap (keymap (return . ,send-cb))))
+  (:use-memo field-props [] `(keymap (keymap (return . ,send-cb))))
 
   `((string :space "a")
     ,@(--map-indexed
@@ -51,8 +51,8 @@
                      (propertize "\n" 'face '(lens-chat-ai lens-chat-footer))))
        (reverse history))
 
-    ;; (text-field :input ,input ,set-input :props ,field-props :focus ,field-focus-id)
-    (text-box :input ,input ,set-input :onenter ,send-cb :width 50)
+    (text-field :input ,input ,set-input :props ,field-props)
+    ;; (text-box :input ,input ,set-input :onenter ,send-cb :width 50)
     (button :send "Send" ,send-cb)))
 
 
