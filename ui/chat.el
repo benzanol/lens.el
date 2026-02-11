@@ -25,7 +25,6 @@
 
   (:use-callback
     send-cb ()
-    (message "SEND CB")
     (set-input "")
     (set-history (cons (list input "") history))
 
@@ -38,7 +37,8 @@
       0.05)))
 
   (:use-callback focus-field () (lens-ui-focus ctx :input))
-  (:use-text-properties 'keymap `(keymap (return . ,focus-field)))
+  (:use-memo keymap nil (lambda (_) `(keymap (return . ,focus-field))))
+  (:use-text-properties 'keymap keymap)
 
   (:let field-props `(keymap (keymap (return . ,send-cb))))
 

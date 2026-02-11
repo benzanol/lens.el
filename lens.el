@@ -1437,7 +1437,7 @@ hook. This function returns SYMBOL."
             name cb
             (let* ((str (cl-loop for sym in path
                                  concat (symbol-name sym) into str
-                                 finally return (format "$%s@%s%s" name ui-id str)))
+                                 finally return (format "lens-%s%s!%s" ui-id str name)))
                    (ret-symbol (make-symbol str)))
               (fset ret-symbol
                     `(lambda (&rest args)
@@ -1587,14 +1587,16 @@ Returns a cons of (VALUE . SETTER-FUNCTION)."
   "Run all pending use-effect hooks in STATE and its children.
 
 KEY-PATH is the current path in the component tree."
-  (let ((children (plist-get state :content)))
-    (when (listp children)
-      (dolist (child children)
-        (lens--ui-run-effects (cdr child) (append key-path (list (car child)))))))
+  ;; Run effects for the current element
   (dolist (hook (plist-get state :hooks))
     (when (and (eq (car hook) :use-effect)
                (nth 3 hook))
-      (funcall (cadr hook)))))
+      (funcall (cadr hook))))
+  ;; Run effects for sub elements
+  (let ((children (plist-get state :content)))
+    (when (listp children)
+      (dolist (child children)
+        (lens--ui-run-effects (cdr child) (append key-path (list (car child))))))))
 
 (defun lens--use-effect (dependencies effect)
   "Define a use-effect hook.
@@ -1651,7 +1653,6 @@ be rerun when one of DEPENDENCIES changes."
          (pcase-let ((`(,start . ,end) (lens--ui-find-ctx-element ctx))
                      (ps properties)
                      (prop nil) (value nil))
-           (message "TXT PROPS %s %s %s" start end ps)
            (lens-silent-edit
             (while ps
               (setq prop (pop ps) value (pop ps))
@@ -1661,7 +1662,14 @@ be rerun when one of DEPENDENCIES changes."
                  (alter-text-property
                   start end 'keymap
                   (lambda (existing)
-                    (if existing (list 'keymap existing value) value))))
+                    ;; If the keymap is already in the existing, do nothing
+                    (cond ((or (eq existing value) (memq value (cdr existing))) existing)
+                          ;; If the existing is already a list of keymaps, prepend
+                          ((and (keymapp existing) (ignore-errors (-every #'keymapp (cdr existing))))
+                           (apply #'list 'keymap value (cdr existing)))
+                          ;; If there is already a keymap, create one combining the two
+                          (existing (list 'keymap value existing))
+                          (value)))))
                 (_ (put-text-property start end prop value)))))))))))
 
 
@@ -1933,10 +1941,9 @@ string to insert between the columns."
       (funcall set-text (car res))
       (set-cursor (cdr res))))
 
-  (:use-text-properties
-   'keymap
-   (if focused? `(keymap (escape . ,unfocus) (return . ,onenter))
-     `(keymap (return . ,focus))))
+  (:use-memo focused-map nil (lambda (_) `(keymap (escape . ,unfocus) (return . ,onenter))))
+  (:use-memo unfocused-map nil (lambda (_) `(keymap (return . ,focus))))
+  (:use-text-properties 'keymap (if focused? focused-map unfocused-map))
 
   (string-join
    (nconc (list (substring header 0 -1))
