@@ -1,0 +1,784 @@
+#+TITLE: Lui.el Documentation
+#+SUBTITLE: Lens UI - React-like Component System for Emacs
+#+AUTHOR: Auto-generated
+#+DATE: 2026-02-11
+#+OPTIONS: toc:3
+
+* Introduction
+
+=lui.el= (Lens UI) extends =lens.el= with a React-like component system for building interactive user interfaces in Emacs.
+
+Key features:
+- Declarative component-based UI
+- React-style hooks (useState, useEffect, useMemo, etc.)
+- Efficient diffing and partial rerendering
+- Focus management for interactive elements
+- Undo-aware state management
+
+* System Architecture
+
+** Extended UML Diagram
+
+This diagram shows how lui.el extends the lens.el architecture:
+
+#+begin_src plantuml :file resources/lui-architecture.png :exports results
+@startuml
+skinparam classAttributeIconSize 0
+skinparam monochrome true
+skinparam shadowing false
+
+package "lens.el Core" {
+  class Lens <<tuple>> {
+    spec : Symbol
+    text : String
+    state : Any
+  }
+
+  class Display <<plist>> {
+    :tostate(text) : State
+    :totext(state) : String
+    :insert(state) : String
+  }
+}
+
+package "lui.el Extension" {
+  class UIDisplay {
+    ui-func : Function
+    ui-id : Integer
+    --
+    Implements Display
+    for component trees
+  }
+
+  class UIState <<plist>> {
+    :original-text : String
+    :ui-id : Integer
+    :buffer : Buffer
+    :ui-func : Function
+    :hooks : List
+    :content : Alist | String
+    :renderer? : Function
+    :element : Element
+  }
+
+  class ComponentState <<plist>> {
+    :hooks : List
+    :content : Alist | String
+    :renderer? : Function
+    :element : Element
+  }
+
+  class GenerationContext <<plist>> {
+    :state : ComponentState
+    :root-state : UIState
+    :path : List
+    :hook-idx : Integer
+    :is-first-call : Boolean
+    :id : Symbol
+  }
+
+  class LensDisplayState <<cons>> {
+    car : UIState
+    cdr : BufferStatesList
+  }
+}
+
+package "Hooks" {
+  abstract class Hook {
+    type : Keyword
+    args : List
+  }
+
+  class UseState {
+    value : Any
+    --
+    Transient state
+    Lost on undo
+  }
+
+  class UseBufferState {
+    value : Any
+    --
+    Persistent state
+    Preserved in undo
+  }
+
+  class UseCallback {
+    name : Symbol
+    callback : Function
+    symbol : Symbol
+    --
+    Creates callable symbol
+  }
+
+  class UseEffect {
+    callback : Function
+    deps : List
+    should-run : Boolean
+    --
+    Side effects after render
+  }
+
+  class UseMemo {
+    generator : Function
+    deps : List
+    value : Any
+    --
+    Memoized computation
+  }
+
+  class UseFocusable {
+    focused : Boolean
+    plist : Plist
+    --
+    :update :on-focus
+    :on-unfocus :render
+  }
+}
+
+package "Components" {
+  class Component <<symbol>> {
+    lens-component : Function
+    properties : Plist
+  }
+
+  class Element <<list>> {
+    component : Symbol
+    key : Keyword
+    args : List
+  }
+
+  class StringComponent
+  class ButtonComponent
+  class FieldComponent
+  class TextFieldComponent
+  class TextBoxComponent
+  class ColumnsComponent
+  class RowsComponent
+}
+
+package "Focus System" {
+  class FocusState <<plist>> {
+    :element : (State . Path)
+    :last-point : Integer
+    :location : (Start . End)
+    :update : Function
+    :on-focus : Function
+    :on-unfocus : Function
+    :render : Boolean
+  }
+}
+
+package "Diffing" {
+  class DiffEngine {
+    +diff-lists(old, new) : Edits
+    --
+    Myers algorithm
+    O((N+M)D) complexity
+  }
+
+  class Edit <<tuple>> {
+    action : :keep|:insert|:delete
+    key : List
+    old : String
+    new : String
+  }
+}
+
+' Relationships
+UIDisplay ..|> Display : implements
+Lens o-- LensDisplayState : state contains
+
+LensDisplayState *-- UIState : car
+UIState *-- ComponentState : nested via :content
+ComponentState *-- Hook : :hooks contains
+
+GenerationContext --> UIState : :root-state
+GenerationContext --> ComponentState : :state
+
+UseState --|> Hook
+UseBufferState --|> Hook
+UseCallback --|> Hook
+UseEffect --|> Hook
+UseMemo --|> Hook
+UseFocusable --|> Hook
+
+Component --> Element : instantiated as
+Element --> ComponentState : generates
+
+StringComponent --|> Component
+ButtonComponent --|> Component
+FieldComponent --|> Component
+TextFieldComponent --|> Component
+TextBoxComponent --|> Component
+ColumnsComponent --|> Component
+RowsComponent --|> Component
+
+UseFocusable --> FocusState : creates
+
+DiffEngine --> Edit : produces
+@enduml
+#+end_src
+
+** Render and Update Flow
+
+#+begin_src plantuml :file resources/lui-flow.png :exports results
+@startuml
+skinparam monochrome true
+skinparam shadowing false
+
+participant User
+participant Buffer
+participant Lens
+participant LUI
+participant Component
+participant Hooks
+
+== Initial Render ==
+User -> LUI: lens-ui-display(ui-func)
+LUI -> LUI: Create UIState
+LUI -> Component: lui--generate-ui(ui-func, nil, nil, state)
+activate Component
+Component -> Hooks: Register hooks
+Hooks --> Component: Hook values
+Component --> LUI: Component tree
+deactivate Component
+LUI -> LUI: lui--state-to-string
+LUI --> Lens: Display spec
+
+== User Interaction ==
+User -> Buffer: Trigger callback (key/click)
+Buffer -> LUI: lui--perform-callback
+LUI -> LUI: lui-modify(state, callback, args)
+activate LUI
+LUI -> LUI: Collect old-rows
+LUI -> Hooks: Apply callback (may update state)
+LUI -> Component: Regenerate tree
+Component -> Hooks: Access updated hooks
+Component --> LUI: New component tree
+LUI -> LUI: lui--string-rows (new-rows)
+LUI -> LUI: lui-diff-lists(old, new)
+LUI -> Buffer: Apply diff (lui-renderer)
+LUI -> Hooks: Run effects
+deactivate LUI
+
+== Focus Change ==
+User -> Buffer: Navigate to focusable
+Buffer -> LUI: lui-focus(ctx, path)
+activate LUI
+LUI -> LUI: Find :use-focusable hook
+LUI -> LUI: Set lui-focused
+LUI -> Hooks: Call :on-focus
+LUI --> Buffer: Add post-command-hook
+deactivate LUI
+
+loop Each Command
+  User -> Buffer: Any command
+  Buffer -> LUI: lui--focused-post-command
+  LUI -> Hooks: Call :update
+  alt Returns nil
+    LUI -> LUI: lui-unfocus
+    LUI -> Hooks: Call :on-unfocus
+  end
+end
+
+@enduml
+#+end_src
+
+* Core Concepts
+
+** Components
+
+Components are functions that generate UI content. They receive a context and return either:
+- A string (leaf content)
+- A list of child components
+
+*** Defining Components
+
+#+begin_src elisp
+(lens-defcomponent my-component (ctx arg1 arg2)
+  :can-be-column t  ; optional property
+
+  (:use-state value set-value 0)
+
+  (format "Value: %d" value))
+#+end_src
+
+*** Defining UI Functions
+
+#+begin_src elisp
+(lens-defui my-ui ()
+  (list (my-component :first "arg1" "arg2")
+        (my-component :second "arg3" "arg4")))
+#+end_src
+
+** Elements
+
+An element is a component invocation: =(COMPONENT KEY ARGS...)=
+
+| Part      | Description                           |
+|-----------+---------------------------------------|
+| COMPONENT | Symbol with =lens-component= property |
+| KEY       | Keyword for identification (=:my-key=)  |
+| ARGS      | Arguments passed to component         |
+
+Keys must be unique among siblings and are used for:
+- State tree navigation
+- Efficient diffing
+- Focus targeting
+
+** State Structure
+
+*** Component State
+
+#+begin_src elisp
+(:hooks ((HOOK-TYPE ARG1 ...) ...)
+ :content "string" | ((KEY . CHILD-STATE) ...)
+ :renderer FUNCTION  ; optional
+ :element ELEMENT)
+#+end_src
+
+*** UI State (Root)
+
+#+begin_src elisp
+(:original-text TEXT
+ :ui-id INTEGER
+ :buffer BUFFER
+ :ui-func FUNCTION
+ ;; plus component state properties
+ :hooks ... :content ...)
+#+end_src
+
+*** Lens Display State
+
+#+begin_src elisp
+(UI-STATE . BUFFER-STATES)
+#+end_src
+
+=BUFFER-STATES= is a list of =(PATH HOOK-IDX VALUE)= for undo support.
+
+* Hooks
+
+Hooks provide state and lifecycle management within components. They must be called in the same order on every render.
+
+** :use-state
+
+Transient local state (lost on undo).
+
+#+begin_src elisp
+(:use-state count set-count 0)
+
+;; count: current value
+;; set-count: setter function
+;; 0: initial value
+
+(set-count (1+ count))
+#+end_src
+
+** :use-buffer-state
+
+Persistent state (preserved in undo history).
+
+#+begin_src elisp
+(:use-buffer-state text set-text "initial")
+
+;; Works like :use-state but survives undo/redo
+#+end_src
+
+** :use-callback
+
+Create a callable function for keymaps/actions.
+
+#+begin_src elisp
+(:use-callback on-click ()
+               (message "Clicked!"))
+
+;; on-click is a symbol you can use in keymaps
+(:use-text-properties 'keymap `(keymap (return . ,on-click)))
+#+end_src
+
+With arguments:
+#+begin_src elisp
+(:use-callback handle-input (value)
+               (set-text value))
+#+end_src
+
+** :use-effect
+
+Run side effects after rendering.
+
+#+begin_src elisp
+(:use-effect [count]  ; dependencies
+             (message "Count changed to %d" count))
+
+;; Runs when count changes
+;; Empty [] means run only on first render
+#+end_src
+
+** :use-memo
+
+Memoize computed values.
+
+#+begin_src elisp
+(:use-memo expensive-result [input]
+           (compute-expensive input))
+
+;; Only recomputes when input changes
+#+end_src
+
+** :use-focusable
+
+Make the element focusable.
+
+#+begin_src elisp
+(:use-focusable focused?
+                :update (lambda (plist) t)  ; return nil to unfocus
+                :on-focus (lambda (plist) ...)
+                :on-unfocus (lambda (plist) ...)
+                :render t)  ; rerender on focus change
+#+end_src
+
+** :use-text-properties
+
+Apply text properties to the element.
+
+#+begin_src elisp
+(:use-text-properties 'face 'bold
+                      'keymap my-keymap)
+#+end_src
+
+** :use-renderer
+
+Set a custom renderer for child components.
+
+#+begin_src elisp
+(:use-renderer ctx
+               (lambda (children)
+                 (string-join children " | ")))
+#+end_src
+
+* Built-in Components
+
+** string
+
+Simple read-only text.
+
+#+begin_src elisp
+(string :key "Hello, World!")
+(string :key (list "line 1" "line 2"))  ; joined with newlines
+#+end_src
+
+** button
+
+Clickable button.
+
+#+begin_src elisp
+(button :ok "OK" on-click)
+(button :cancel "Cancel" on-cancel :face 'warning)
+#+end_src
+
+** field
+
+Basic editable text field.
+
+#+begin_src elisp
+(field :input text on-change
+       :header "[start]\n"
+       :footer "\n[end]")
+#+end_src
+
+** text-field
+
+Enhanced field with focus support.
+
+#+begin_src elisp
+(text-field :editor text set-text
+            :header ">>> "
+            :footer " <<<"
+            :props '(face font-lock-string-face))
+#+end_src
+
+** text-box
+
+Bordered text input with word wrapping.
+
+#+begin_src elisp
+(text-box :input text set-text
+          :width 40
+          :onenter submit-callback)
+#+end_src
+
+Features:
+- Unicode/ASCII borders
+- Word wrapping
+- Cursor tracking
+- ESC to exit, RET for onenter
+
+** columns
+
+Horizontal layout.
+
+#+begin_src elisp
+(columns :layout
+         (string :col1 "Left")
+         (string :col2 "Middle")
+         (string :col3 "Right"))
+#+end_src
+
+Children must have =:can-be-column= property.
+
+** rows
+
+Vertical layout.
+
+#+begin_src elisp
+(rows :stack
+      (string :row1 "First")
+      (string :row2 "Second")
+      (string :row3 "Third"))
+#+end_src
+
+* API Reference
+
+** Defining UI
+
+*** lens-defui
+
+#+begin_src elisp
+(lens-defui NAME ARGLIST BODY...)
+#+end_src
+
+Define a UI function for use with =lens-ui-display=.
+
+*** lens-defcomponent
+
+#+begin_src elisp
+(lens-defcomponent NAME ARGLIST
+  :property value ...
+  BODY...)
+#+end_src
+
+Define a reusable component.
+
+*** lens-ui-display
+
+#+begin_src elisp
+(lens-ui-display UI-FUNC) -> display-plist
+#+end_src
+
+Create a display specification for a UI function.
+
+** State Management
+
+*** lui-modify
+
+#+begin_src elisp
+(lui-modify STATE CALLBACK ARGS)
+#+end_src
+
+Execute =CALLBACK= with =ARGS= and rerender the UI.
+
+** Focus Management
+
+*** lui-focus
+
+#+begin_src elisp
+(lui-focus CTX &rest RELATIVE-PATH)
+#+end_src
+
+Focus the element at =RELATIVE-PATH= from =CTX=.
+
+*** lui-unfocus
+
+#+begin_src elisp
+(lui-unfocus)
+#+end_src
+
+Unfocus the currently focused element.
+
+** Navigation
+
+*** lui-find-lens
+
+#+begin_src elisp
+(lui-find-lens STATE) -> region
+#+end_src
+
+Navigate to and return the lens for =STATE=.
+
+*** lui-find-element
+
+#+begin_src elisp
+(lui-find-element STATE KEY-PATH) -> (START . END)
+#+end_src
+
+Find element at =KEY-PATH= within =STATE='s lens.
+
+*** lui-find-ctx
+
+#+begin_src elisp
+(lui-find-ctx CTX) -> (START . END)
+#+end_src
+
+Find element for the given context.
+
+** Utilities
+
+*** lui-text-to-box
+
+#+begin_src elisp
+(lui-text-to-box TEXT &rest PROPS) -> string
+#+end_src
+
+Wrap =TEXT= in a border box. Props: =:width=, =:title=, =:charset=, =:shrink=, =:pad=.
+
+*** lui-diff-lists
+
+#+begin_src elisp
+(lui-diff-lists OLD-LIST NEW-LIST) -> edits
+#+end_src
+
+Diff two lists using Myers algorithm.
+
+* Customization
+
+** Variables
+
+| Variable        | Default | Description                          |
+|-----------------+---------+--------------------------------------|
+| =lui-debug=     | nil     | Show rerender highlights             |
+
+** Faces
+
+| Face                    | Description                    |
+|-------------------------+--------------------------------|
+| =lui-rerender-highlight= | Highlight for debug rerendering |
+| =lens-button=           | Default button face            |
+
+** Hooks
+
+| Hook                  | Description               |
+|-----------------------+---------------------------|
+| =lens-box-enter-hook= | Run when entering text-box |
+| =lens-box-exit-hook=  | Run when exiting text-box  |
+
+* Examples
+
+** Counter
+
+#+begin_src elisp
+(lens-defui counter-ui ()
+  (:use-state count set-count 0)
+  (:use-callback increment () (set-count (1+ count)))
+  (:use-callback decrement () (set-count (1- count)))
+
+  (list
+   (string :display (format "Count: %d" count))
+   (columns :buttons
+            (button :dec "-" decrement)
+            (button :inc "+" increment))))
+
+;; Usage:
+(lens-create (lens-replace-source "")
+             (lens-ui-display #'counter-ui))
+#+end_src
+
+** Text Editor
+
+#+begin_src elisp
+(lens-defui editor-ui ()
+  (:use-buffer-state text set-text "")  ; survives undo
+  (:use-state char-count set-char-count 0)
+
+  (:use-effect [text]
+               (set-char-count (length text)))
+
+  (list
+   (text-box :editor text set-text :width 50)
+   (string :status (format "Characters: %d" char-count))))
+#+end_src
+
+** Dynamic List
+
+#+begin_src elisp
+(lens-defui list-ui ()
+  (:use-state items set-items '("Item 1" "Item 2"))
+
+  (:use-callback add-item ()
+                 (set-items (append items
+                                    (list (format "Item %d"
+                                                  (1+ (length items)))))))
+
+  (cons (button :add "Add Item" add-item)
+        (cl-loop for item in items
+                 for i from 0
+                 collect (string (intern (format ":item-%d" i))
+                                 item))))
+#+end_src
+
+* State Management Deep Dive
+
+** Transient vs Persistent State
+
+| Type               | Hook               | Undo Behavior        | Use Case                  |
+|--------------------+--------------------+----------------------+---------------------------|
+| Transient          | =:use-state=       | Lost on undo         | UI state, selections      |
+| Persistent         | =:use-buffer-state= | Preserved            | User data, form values    |
+
+** How Buffer State Works
+
+1. On each render, buffer states are collected
+2. Stored in lens display state as =(UI-STATE . BUFFER-STATES)=
+3. =UI-STATE= is shared/mutated across all undo states
+4. =BUFFER-STATES= is copied per undo version
+5. Before callbacks, buffer states are propagated back to UI-STATE
+
+** Hook Order Constraint
+
+Hooks must be called in the same order every render:
+
+#+begin_src elisp
+;; BAD - conditional hook
+(when condition
+  (:use-state x set-x 0))  ; will break
+
+;; GOOD - unconditional hook
+(:use-state x set-x 0)
+(when condition
+  (set-x 1))
+#+end_src
+
+* Debugging
+
+** Enable Debug Mode
+
+#+begin_src elisp
+(setq lui-debug t)
+#+end_src
+
+This highlights rerendered regions briefly after each update.
+
+** Inspecting State
+
+#+begin_src elisp
+;; Get the lens at point
+(lens-at-point)
+
+;; The third element of the lens is (UI-STATE . BUFFER-STATES)
+(caddr (car (lens-at-point)))
+#+end_src
+
+* Integration with lens.el
+
+lui.el integrates with lens.el through the display system:
+
+1. =lens-ui-display= creates a display plist
+2. =:tostate= generates the component tree
+3. =:insert= converts the tree to insertable text
+4. Modifications use =lens-modify= with custom renderer
+5. The renderer applies diffs for efficient updates
+
+Key integration points:
+- =lens-silent-edit= for modification batching
+- =lens-save-position-in-ui= for cursor preservation
+- Field system from lens.el for editable content
