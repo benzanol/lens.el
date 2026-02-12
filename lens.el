@@ -1,22 +1,24 @@
-;;; lens.el --- ui library for emacs -*- lexical-binding: t; -*-
+;;; lens.el --- interactive stateful widgets for emacs -*- lexical-binding: t; -*-
 ;;; Commentary:
 ;;; Code:
 
-(require 'dash)
+(require 'cl-lib)
 (require 'f)
 (require 'ol)
 (require 'org)
 (require 'org-element)
 (require 'org-indent)
+(require 'seq)
 (require 'text-property-search)
 
 
 (defgroup lens nil
-  "Customization group for lens."
+  "Customization group for lens.el."
   :prefix "lens-"
   :group 'tools)
 
 
+;;; ============================================================
 ;;; Variables
 ;;;; User Variables
 
@@ -39,79 +41,8 @@ redisplay will be cancelled.")
   "List of lens buffers that reference the current buffer.")
 
 
+;;; ============================================================
 ;;; Utilities
-;;;; Let macro
-
-(defvar lens--let-keywords '((:let . let)
-                             (:flet . cl-flet)
-                             (:when-let . when-let)
-                             (:pcase-let . pcase-let)
-                             (:-let . -let))
-  "An alist mapping let keywords to their corresponding functions.")
-
-
-(defmacro lens-let-body (&rest body)
-  "A macro designed to make ui component bodies simpler.
-
-If any of body is (LET-KEYWORD VAR VAL), then this will be compiled to a
-let expression containing the rest of the body. LET-KEYWORD can be any
-of `:let', `:flet', `:when-let', `:pcase-let', or `:-let'.
-
-So,
-  (:let a 4)
-  (:when-let b (1+ a))
-  (+ a b)
-will be converted to
-  (let ((a 4))
-    (when-let ((b (1+ a)))
-      (+ a b)))
-
-Furthermore, the car of body can be a vector containing custom symbols
-to convert to special forms. Each entry should be a cons cell mapping
-the desired symbol to a function. When the symbol is used as a function
-call in the top level of BODY, this function will be called at compile
-time to generate the new expression.
-
-The first argument is a list of Lisp expressions, which is the result of
-applying `lens-let-body' to the remaining body. The remaining arguments
-are the list of arguments passed to the call. The return value is a list
-of Lisp expressions to replace the original body.
-
-For example, the following is expression used for use state:
-  [(:use-state
-    (lambda (body state-var set-var)
-      `((let* ((=use-state= (lens--use-state))
-               (,state-var (car =use-state=)))
-          (cl-flet ((,set-var (cdr =use-state=)))
-            ,@body)))))]
-
-This allows for the following syntax:
-  (:use-state count set-count)
-  (set-count (1+ count))"
-
-  (let ((lens--let-keywords '((:let . let)
-                              (:flet . cl-flet)
-                              (:when-let . when-let)
-                              (:pcase-let . pcase-let)
-                              (:-let . -let)))
-        (custom (when (vectorp (car body)) (append (pop body) nil)))
-        exprs func lets)
-    ;; Go through the expressions in reverse
-    (dolist (line (reverse body))
-      (cond ((not (listp line)) (push line exprs))
-            ((eq (car line) :let)
-             (push (cadr line) lets)
-             (push `(setq ,@(cdr line)) exprs))
-            ((setq func (alist-get (car line) lens--let-keywords))
-             (setq exprs `((,func (,(cdr line)) ,@exprs))))
-            ((setq func (alist-get (car line) custom))
-             (setq exprs (apply func exprs (cdr line))))
-            (t (push line exprs))))
-    (cond (lets `(let ,lets ,@exprs))
-          ((> (length exprs) 1) (cons #'progn exprs))
-          (t (car exprs)))))
-
-
 ;;;; Utils
 
 (defmacro lens-save-position (&rest body)
@@ -295,6 +226,18 @@ correct order, the reverse of what was stored.)")
         (funcall (car command) (nreverse (cdr command)))))))
 
 
+;;;; String width
+
+(defun lens-string-width (str &optional start end)
+  "Calculate the width of STR in columns.
+
+The `string-width' function doesn't work correctly in certain situations
+for some reason. For example, it believes an em-dash has width 1."
+  (if start (string-width str start end)
+    (let ((inhibit-read-only t))
+      (/ (string-pixel-width str) (string-pixel-width "a")))))
+
+
 ;;;; Fields
 
 (defvar lens--modified-fields nil
@@ -341,7 +284,7 @@ the field."
   (push (list :buffer (current-buffer)
               :pos (set-marker (make-marker) beg)
               ;; If it was modified by an undo action, mark it as such
-              :undo (when (--find (eq (cadr it) #'primitive-undo) (backtrace-frames)) t))
+              :undo (when (cl-loop for frame in (backtrace-frames) thereis (eq (cadr it) #'primitive-undo)) t))
         lens--modified-fields)
   (add-hook 'post-command-hook #'lens--field-modification-callback))
 
@@ -385,171 +328,7 @@ the previous command, as described in `lens--field'."
                (lens--refresh-buffer hb fe)))))))))
 
 
-;;;; Box helpers
-
-(defvar lens-textbox-chars
-  '((unicode (top-left     . "\u250C")
-             (top-right    . "\u2510")
-             (bottom-left  . "\u2514")
-             (bottom-right . "\u2518")
-             (horizontal   . "\u2500")
-             (vertical     . "\u2502"))
-    (ascii (top-left     . "+")
-           (top-right    . "+")
-           (bottom-left  . "+")
-           (bottom-right . "+")
-           (horizontal   . "-")
-           (vertical     . "|"))))
-
-(defun lens-string-width (str &optional start end)
-  "Calculate the width of STR in columns.
-
-The `string-width' function doesn't work correctly in certain situations
-for some reason. For example, it believes an em-dash has width 1."
-  (if start (string-width str start end)
-    (let ((inhibit-read-only t))
-      (/ (string-pixel-width str) (string-pixel-width "a")))))
-
-(defun lens-text-to-box (text &rest props)
-  (pcase-let ((`(,body ,head ,foot) (apply #'lens--textbox-wrap text props)))
-    (concat head
-            (cl-loop for (content prefix suffix) in body
-                     concat (concat prefix content suffix))
-            foot)))
-
-(defun lens--textbox-wrap (text &rest props)
-  "Returns (BODY HEAD FOOT CURSOR-LINE CURSOR-COL).
-
-HEAD and FOOT are strings for the header and footer.
-
-BODY is a list of lines which look like (CONTENT PREFIX SUFFIX)
-
-PROPS has the following meaningful properties:
-  :cursor - The 0-index of the cursor in the original text
-  :charset - unicode or ascii
-  :width - The outer width (default 50)
-  :shrink - Shrink if the text is smaller than the width
-  :pad - The horizontal padding on each side (default 1)
-  :title - Text displayed in the top border
-  :box-props - Plist of text properties applied only to the border"
-  (lens-let-body
-   (:let hpad (or (plist-get props :pad) 1))
-   (:let title (plist-get props :title))
-   (:let width (or (plist-get props :width) 50))
-   (when (plist-get props :shrink)
-     (let ((longest-line (cl-loop for line in (split-string text "\n")
-                                  maximize (1+ (lens-string-width line)))))
-       (setq width (min width (max (+ 2 (* hpad 2) longest-line)
-                                   (if title (+ 6 (length title)) 0))))))
-
-   (:let inner-width (- width 2 (* 2 hpad)))
-   (unless (> inner-width 0) (error "Text box is too thin"))
-
-   (:let cursor (plist-get props :cursor))
-   (when (and cursor (> cursor (length text))) (error "Cursor position exceeds text length"))
-
-   (:let chars (alist-get (or (plist-get props :charset) 'ascii)
-                          lens-textbox-chars))
-
-   ;; 3 chars are needed before the title, 3 after the title
-   (:let show-title-len (min (- width 6) (length title)))
-   (:let show-title (and title (> show-title-len 0)
-                         (substring title 0 show-title-len)))
-
-   (:let hor (alist-get 'horizontal chars))
-   (:let head-str
-         (if show-title
-             (concat (alist-get 'top-left chars)
-                     hor " " show-title " " hor
-                     (make-string (- width 6 show-title-len) (aref hor 0))
-                     (alist-get 'top-right chars)
-                     "\n")
-           (concat (alist-get 'top-left chars)
-                   (make-string (- width 2) (aref hor 0))
-                   (alist-get 'top-right chars)
-                   "\n")))
-   (:let foot-str (concat (alist-get 'bottom-left chars)
-                          (make-string (- width 2) (aref hor 0))
-                          (alist-get 'bottom-right chars)))
-
-   (:let body-lines (list ""))
-   ;; The current index we are looking at in TEXT
-   (:let idx 0)
-   ;; The start of the current word
-   (:let cur-word-start nil)
-
-   (:flet add-word (word &optional is-word)
-          (cond ((> (lens-string-width word) inner-width)
-                 (when (string-empty-p (car body-lines)) (pop body-lines))
-                 (while (> (lens-string-width word) inner-width)
-                   (let ((idx (cl-loop for i from 1 below (1+ (length word))
-                                       when (> (lens-string-width word 0 i) inner-width)
-                                       do (cl-return (1- i))
-                                       finally (cl-return (length word)))))
-                     (push (substring word 0 idx) body-lines)
-                     (setq word (substring word idx))))
-                 (push word body-lines))
-                ((or (> (+ (lens-string-width word) (lens-string-width (car body-lines)) (if is-word 1 0))
-                        inner-width))
-                 (when (string-empty-p (car body-lines)) (pop body-lines))
-                 (push word body-lines))
-                (t (setcar body-lines (concat (car body-lines) word)))))
-
-   ;; Iterate through the text
-   (while (< idx (length text))
-     (if (not (string-match-p "[\n\s]" (substring text idx (1+ idx))))
-         (setq cur-word-start (or cur-word-start idx))
-
-       ;; Add the previous word to the body
-       (when cur-word-start
-         (add-word (substring text cur-word-start idx) t)
-         (setq cur-word-start nil))
-       ;; Add the space to the body
-       (if (not (eq (aref text idx) ?\n))
-           (add-word (substring text idx (1+ idx)))
-         (add-word (apply #'propertize "¶" 'lens-textbox-newline t 'face 'lens-field-header
-                          (text-properties-at idx text)))
-         (push "" body-lines)))
-     (setq idx (1+ idx)))
-   (when cur-word-start (add-word (substring text cur-word-start idx) t))
-
-   (setq body-lines (nreverse body-lines))
-
-   ;; Determine the cursor position
-   (:let cursor-line nil)
-   (:let cursor-col nil)
-   (when (eq cursor (length text))
-     (setq cursor-line (1- (length body-lines))
-           cursor-col (length (car (last body-lines)))))
-   (when (and cursor (< cursor (length text)))
-     (let ((line-end-pos 0) line-start)
-       (setq cursor-line 0)
-       (while (progn (setq line-end-pos (+ line-end-pos (length (nth cursor-line body-lines))))
-                     (<= line-end-pos cursor))
-         (setq cursor-line (1+ cursor-line)))
-       (setq line-start (- line-end-pos (length (nth cursor-line body-lines))))
-       (setq cursor-col (- cursor line-start))))
-
-   ;; Wrap the lines
-   (:let vert (alist-get 'vertical chars))
-   (:let box-props (plist-get props :box-props))
-
-   (list (--map (list it
-                      (apply #'propertize (concat vert (make-string hpad ?\s))
-                             'rear-nonsticky t
-                             'front-sticky t
-                             box-props)
-                      (apply #'propertize
-                             (concat (make-string (+ (- inner-width (lens-string-width it)) hpad) ?\s)
-                                     vert "\n")
-                             box-props))
-                body-lines)
-         (apply #'propertize head-str box-props)
-         (apply #'propertize foot-str box-props)
-         cursor-line
-         cursor-col)))
-
-
+;;; ============================================================
 ;;; Lens Lifecycle
 ;;;; Creating
 
@@ -567,17 +346,19 @@ To ensure that the undo-history stores the begin-lens and
 end-lens properties, the header and footer contain a random
 number. This ensures that the undo system knows that it has
 changed, ensuring that it stores the new lens value."
-  (-let* (((&plist :head-props hps :foot-props fps :head-face hf :foot-face ff) (get (car lens) :style))
-          (rand (format "%05d" (random 99999)))
-          (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
-          (h-text (format "[%s] %s" rand (or title "")))
-          (h (apply #'propertize h-text 'lens-begin lens 'read-only t hps))
-          (f (apply #'propertize (format "[%s]\n" rand) 'lens-end lens 'read-only t fps)))
-    ;; Add the head-face and foot-face specified in the style
-    (lens--append-face 0 (length h) hf h)
-    (lens--append-face 0 (length f) ff f)
-    ;; Make the header and footer non-sticky.
-    (cons (lens--make-sticky h) (lens--make-sticky f))))
+  (cl-destructuring-bind
+      (&key ((:head-props hps)) ((:foot-props fps)) ((:head-face hf)) ((:foot-face ff)))
+      (get (car lens) :style)
+    (let* ((rand (format "%05d" (random 99999)))
+           (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
+           (h-text (format "[%s] %s" rand (or title "")))
+           (h (apply #'propertize h-text 'lens-begin lens 'read-only t hps))
+           (f (apply #'propertize (format "[%s]\n" rand) 'lens-end lens 'read-only t fps)))
+      ;; Add the head-face and foot-face specified in the style
+      (lens--append-face 0 (length h) hf h)
+      (lens--append-face 0 (length f) ff f)
+      ;; Make the header and footer non-sticky.
+      (cons (lens--make-sticky h) (lens--make-sticky f)))))
 
 (defun lens--generate-insert-text (lens)
   "Generate the full insert string for LENS."
@@ -808,8 +589,8 @@ Should be nil or a plist of the form:
   (when (text-property-not-all (point-min) (point-max) 'lens-begin nil)
     (setq lens--presave
           (list :text (buffer-string) :pos (point)
-                :overlays (--map (list (overlay-start it) (overlay-end it) (overlay-properties it))
-                                 (overlays-in (point-min) (point-max)))))
+                :overlays (cl-loop for ol in (overlays-in (point-min) (point-max))
+                                   collect (list (overlay-start ol) (overlay-end ol) (overlay-properties ol)))))
     (add-hook 'after-save-hook #'lens--after-save-once nil 'local)
 
     (when lens-save-lenses-on-save
@@ -842,6 +623,7 @@ Should be nil or a plist of the form:
     (set-buffer-modified-p nil)))
 
 
+;;; ============================================================
 ;;; Some Sources and Displays
 ;;;; Region Source
 
@@ -870,7 +652,7 @@ buffer, but should not be included in the lens text."
 This function is designed to be set up as an `after-change-hook',
 hance _AFTER-CHANGE-ARGS, although the args are ignored."
   ;; Remove killed buffers
-  (setq lens--buffer-referencers (-filter #'buffer-live-p lens--buffer-referencers))
+  (setq lens--buffer-referencers (seq-filter #'buffer-live-p lens--buffer-referencers))
 
   ;; Save information from the source buffer, since we will be moving between buffers
   (let* ((str (string-trim (buffer-substring-no-properties (point-min) (point-max)) "\n*" "\n*"))
@@ -994,1136 +776,100 @@ and returns the new value of the text data."
         :insert #'lens--raw-display-insert))
 
 
-;;; Ui
-;;;; Diffing algorithm
+;;; ============================================================
+;;; Auto Mode
+;;;; Org Matchers
 
-(defun lens--ui-diff (old-list new-list)
-  "Diff OLD-LIST and NEW-LIST of UI elements using Myers algorithm.
+(defun lens--org-forward-filter (text)
+  "Escape org headings in TEXT by wrapping them in underscores."
+  (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
 
-Comparison is done using the car of each element, so elements can have
-different cdr but still be considered the same.
+(defun lens--org-backward-filter (text)
+  "Unescape org headings in TEXT by removing surrounding underscores."
+  (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
 
-Returns a list of (:keep/:insert/:delete CAR OLD-CDR NEW-CDR)."
-  (let* ((n (length old-list))
-         (m (length new-list))
-         (max-d (+ n m))
-         (old-vec (vconcat old-list))
-         (new-vec (vconcat new-list))
-         (v-offset (1+ max-d))
-         (v (make-vector (+ (* 2 max-d) 3) 0))
-         (trace '())
-         (final-d 0))
-
-    (cond
-     ((and (= n 0) (= m 0)) '())
-     ((= n 0) (mapcar (lambda (e) (list :insert (car e) nil e)) new-list))
-     ((= m 0) (mapcar (lambda (e) (list :delete (car e) e nil)) old-list))
-     (t
-      ;; Forward pass
-      (catch 'found
-        (dotimes (d (1+ max-d))
-          (push (copy-sequence v) trace)
-          (let ((k (- d)))
-            (while (<= k d)
-              (let* ((go-down (or (= k (- d))
-                                  (and (/= k d)
-                                       (< (aref v (+ v-offset k -1))
-                                          (aref v (+ v-offset k 1))))))
-                     (x (if go-down
-                            (aref v (+ v-offset k 1))
-                          (1+ (aref v (+ v-offset k -1)))))
-                     (y (- x k)))
-                (while (and (< x n) (< y m)
-                            (equal (car (aref old-vec x))
-                                   (car (aref new-vec y))))
-                  (setq x (1+ x) y (1+ y)))
-                (aset v (+ v-offset k) x)
-                (when (and (>= x n) (>= y m))
-                  (setq final-d d)
-                  (throw 'found t)))
-              (setq k (+ k 2))))))
-
-      ;; Backtrack
-      (let ((x n)
-            (y m)
-            (edits '()))
-        ;; Walk back through each edit step
-        (let ((d final-d))
-          (while (> d 0)
-            (let* ((v-prev (nth (- final-d d) trace))
-                   (k (- x y))
-                   (go-down (or (= k (- d))
-                                (and (/= k d)
-                                     (< (aref v-prev (+ v-offset k -1))
-                                        (aref v-prev (+ v-offset k 1))))))
-                   (prev-k (if go-down (1+ k) (1- k)))
-                   (prev-x (aref v-prev (+ v-offset prev-k)))
-                   (prev-y (- prev-x prev-k)))
-              ;; Record diagonal matches (in reverse)
-              (while (and (> x prev-x) (> y prev-y))
-                (setq x (1- x) y (1- y))
-                (push (let ((old (aref old-vec x))
-                            (new (aref new-vec y)))
-                        (list :keep (car old) (cdr old) (cdr new)))
-                      edits))
-              ;; Record the edit
-              (if go-down
-                  (progn (setq y (1- y))
-                         (let ((val (aref new-vec y)))
-                           (push (list :insert (car val) nil (cdr val)) edits)))
-                (setq x (1- x))
-                (push (let ((val (aref old-vec x)))
-                        (list :delete (car val) (cdr val) nil))
-                      edits)))
-            (setq d (1- d))))
-        ;; Handle initial diagonal (d=0 matches)
-        (while (and (> x 0) (> y 0))
-          (setq x (1- x) y (1- y))
-          (push (let ((old (aref old-vec x))
-                      (new (aref new-vec y)))
-                  (list :keep (car old) (cdr old) (cdr new)))
-                edits))
-        edits)))))
+(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-link-any-re))
+(defun lens-auto--org-file-link ()
+  "Create a lens from an org file link at the current match."
+  (let* ((beg (match-beginning 0)) (end (match-end 0))
+         (context (org-element-context))
+         (link-type (and (eq (car context) 'link) (org-element-property :type context)))
+         (path (and link-type (string= link-type "file") (org-element-property :path context))))
+    (when path
+      (lens--replace-create beg end (lambda (str) (lens-file-source path str))
+                            (lens-raw-display #'lens--org-forward-filter
+                                              #'lens--org-backward-filter)))))
 
 
-;;;; Rendering
-
-;; Basic gray background
-(defface lens-rerender-highlight '((t (:background "#505464")))
-  "Highlight the sections of the lens that are rerendered.")
+(defvar lens-auto-matchers:org-mode
+  `((,lens-auto--org-link-re lens-auto--org-file-link)))
 
 
-(defun lens--ui-state-to-string (state)
-  (cl-loop for ((keys) . string) in (lens--ui-string-rows state nil)
-           for newline = (propertize "\n" 'read-only t 'lens-element-key keys)
-           concat (concat string newline)))
+;;;; Mode
 
-(defun lens--ui-nested-rerender-hooks (state)
-  "Return a nested list of hooks which are relevant for rerendering.
+(defvar-local lens-auto-matchers nil
+  "Alist of a regexp to a function.")
 
-This is for the purpose of calculating diffs between ui states."
-  (let ((content (plist-get state :content)))
-    (cons (cl-loop for hook in (plist-get state :hooks)
-                   nconc (pcase (car hook)
-                           ((or :use-state :use-buffer-state :use-focusable)
-                            (list (cadr hook)))))
-          (when (listp content)
-            (--map (lens--ui-nested-rerender-hooks (cdr it)) content)))))
+(defvar lens-auto-mode-alist
+  `((org-mode . ,lens-auto-matchers:org-mode))
+  "Alist of major modes to values of `lens-auto-matchers'.")
 
-(defun lens--ui-string-rows (state key-path)
-  "Returns a list of rows.
+(define-minor-mode lens-auto-mode
+  "Automatically create lenses based on regexps."
+  :global nil
+  :init-value nil
+  (if (not lens-auto-mode) (lens-remove-all)
+    (setq lens-auto-matchers (alist-get major-mode lens-auto-mode-alist))
+    (lens-auto-insert-all)))
 
-Each row has the form ((PATH ELEMENT STATE-HOOKS) . TEXT).
+(defun lens-auto-search-forward ()
+  "Search forward for the next auto-lens match.
 
-This format is designed to be suitable for diffing, as used in
-`lens--ui-rerender'."
-  (let* ((content (plist-get state :content))
-         (element (plist-get state :element))
-         (renderer (plist-get state :renderer)))
-    (if (or (stringp content) renderer)
-        (list (cons (list key-path element (lens--ui-nested-rerender-hooks state))
-                    (if (not renderer) content
-                      (funcall renderer
-                               (--map (lens--ui-state-to-string (cdr it)) content)))))
-      (--mapcat (lens--ui-string-rows (cdr it) (append key-path (list (car it))))
-                content))))
+Returns the matching entry from `lens-auto-matchers', or nil if none
+found."
+  (let ((init (point))
+        match-pos match-assoc)
+    (dolist (assoc lens-auto-matchers)
+      (goto-char init)
+      (and (re-search-forward (car assoc) nil :noerror)
+           (or (null match-pos) (< (match-beginning 0) match-pos))
+           (setq match-pos (match-beginning 0) match-assoc assoc)))
+    (when match-pos
+      (goto-char match-pos)
+      (looking-at (car match-assoc)) ;; Set the match data
+      match-assoc)))
 
-(defun lens--ui-renderer (state old-rows he _fb)
-  (let* ((new-rows (lens--ui-string-rows state nil))
-         (diff (lens--ui-diff old-rows new-rows)))
-
-    (lens-save-position-in-ui
-     (goto-char (1+ he))
-     ;; Apply each diff element
-     (pcase-dolist (`(,action (,key-path) ,_old_str ,new-str) (append diff (list nil)))
-       (let ((start (point)) match)
-         ;; The last pass through is just to record the end positions of the last element
-         (when action
-           (if (eq action :insert)
-               (progn (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
-                      (let ((ol (make-overlay start (point))))
-                        (overlay-put ol 'face 'lens-rerender-highlight)))
-             ;; The match is the newline at the end of the old element
-             (setq match (text-property-search-forward 'lens-element-key))
-             (cl-assert match)
-             (cl-assert (equal (prop-match-value match) key-path))
-             (when (eq action :delete) (delete-region start (point))))))))
-
-    (run-with-timer
-     0.07 nil
-     #'(lambda (buf)
-         (with-current-buffer buf
-           (remove-overlays nil nil 'face 'lens-rerender-highlight)))
-     (current-buffer))))
-
-
-;;;; Finding things
-
-(defun lens--ui-find-region (state)
-  "Go to and return the region associated with STATE, or error."
-  (set-buffer (plist-get state :buffer))
-  (goto-char (point-min))
-
-  (or (text-property-search-forward
-       'lens-begin state
-       #'(lambda (st lens) (eq st (car (caddr lens)))))
-      (error "Lens not found"))
-
-  (let ((region (lens-at-point)))
-    (or (eq state (car (caddr (car region))))
-        (error "Incorrect lens found"))
-    region))
-
-(defun lens--ui-find-element (state key-path)
-  "Go to and return the element associated with KEY-PATH.
-
-This will first find the lens associated with state STATE, and then find
-the corresponding element within that lens."
-  (let* ((region (lens--ui-find-region state))
-         (hb (nth 1 region))
-         (fe (nth 4 region)))
-    (save-restriction
-      (goto-char fe)
-      (narrow-to-region hb fe)
-      ;; This will get to the newline at the very end of the element
-      (or (text-property-search-backward
-           'lens-element-key
-           key-path
-           #'(lambda (target found)
-               ;; Checks if `found' starts with `target'
-               (and (listp found)
-                    (cl-search target found :end2 (length target)))))
-          (error "Element end not found: %s" key-path))
-      (forward-char -1)
-      (let ((end (point)))
-        (or (text-property-search-backward
-             'lens-element-key
-             key-path
-             #'(lambda (target found)
-                 ;; Checks if `found' starts with `target'
-                 (and found
-                      (not (and (listp found)
-                                (cl-search target found :end2 (length target)))))))
-            (error "Element start not found: %s" key-path))
-        (forward-char 1)
-        (cons (point) end)))))
-
-(defun lens--ui-find-ctx-element (ctx)
-  "Wrapper for `lens--ui-find-element' using a ctx object."
-  (lens--ui-find-element (plist-get ctx :root-state) (plist-get ctx :path)))
-
-
-;;;; Generating uis
-
-(defvar lens--current-ctx nil)
-
-(defun lens--generate-ui (elem path old-state root-state)
-  "Generate the UI for a component.
-
-ELEM is either (ELEM KEY ARGS...) or a ui function.
-
-PATH is a list of keywords, the keys of each of the parent elements. For
-the root element, this will be nil.
-
-OLD-STATE is the previous state for this component (which will be
-mutated), or nil if this is the first time generating the component.
-
-ROOT-STATE is the root state for the ui, or nil if this is the root
-component, and it is the first time generating the root component.
-
-Returns the state value used for the new element. This will be either
-OLD-STATE (if non nil), ROOT-STATE (if this is the root component), or a
-newly created state value.
-
-Creates an intermediate ui-generation context which is a plist containing:
-  :state - The internal state for the component being called
-  :root-state - The root state for the ui
-  :is-first-call - Indicates whether calling a UI component for the
-    first time, or a subsequent time.
-  :path - The key path to the current level
-  :hook-idx - How many hooks have been processed in the current level"
-  (let* ((state (or old-state (and (null path) root-state)
-                    (list :hooks nil :content nil)))
-         (ctx (list :state state
-                    :root-state (or root-state state)
-                    :path path
-                    :hook-idx 0
-                    :is-first-call (null old-state)))
-         ;; Perform the actual function
-         (output (let ((lens--current-ctx ctx))
-                   (if (functionp elem)
-                       (funcall elem ctx)
-                     (apply (get (car elem) 'lens-component) ctx (cddr elem)))))
-         (old-children (unless (stringp (plist-get old-state :content)) (plist-get old-state :content)))
-         child-keys)
-
-    (plist-put state :content
-               (if (stringp output) output
-                 (--map (cons (cond ((not (keywordp (cadr it)))
-                                     (error "First argument to component must be a keyword"))
-                                    ((memq (cadr it) child-keys)
-                                     (error "Duplicate child key: %s" (cadr it)))
-                                    (t (car (push (cadr it) child-keys))))
-                              (lens--generate-ui
-                               it (append path (list (cadr it)))
-                               (alist-get (cadr it) old-children)
-                               (plist-get ctx :root-state)))
-                        output)))
-
-    (plist-put state :element (unless (functionp elem) elem))))
-
-
-;;;; Hook helper macro
-
-(defmacro lens--register-hook (ctx type &rest args)
-  (declare (indent 2))
-  `(let* ((state (plist-get ctx :state))
-          (hooks (plist-get state :hooks))
-          (hook-idx (plist-get ctx :hook-idx))
-          hook)
-
-     (if (plist-get ,ctx :is-first-call)
-         ;; Add a hook to the hooks list
-         (progn (cl-assert (eq (length hooks) hook-idx))
-                (setq hook (list ,type ,@args))
-                (plist-put state :hooks (nconc hooks (list hook))))
-       ;; Check if the indexed hook has the correct type
-       (setq hook (nth hook-idx hooks))
-       (unless hook (error "Called %s hook where no hook was previously" ,type))
-       (unless (eq (car hook) ,type)
-         (error "Called %s hook where %s hook was previously" ,type (car hook))))
-     (plist-put ctx :hook-idx (1+ hook-idx))
-     hook))
-
-
-;;;; Use focusable
-
-(defvar-local lens-ui-focused nil
-  "The currently focused element in the current buffer.
-
-This is nil, or a plist representing the current focused element.
-
-The plist has the following internally managed properties:
-  :element - A cons cell (STATE . PATH) representing the current element.
-  :last-point - The position of the cursor after the previous command.
-  :location - A cons cell (START . END) representing the last known
-    start end end position of the focused element.
-
-It also can have any of the following properties specified by the
-use-focusable hook:
-  :update - A function called every time the cursor moves while the
-    element is focused. If it returns nil, then unfocus the element. If
-    this property is omited, then the element will be immediately
-    unfocused every time it is focused.
-  :on-focus - Function called when focusing.
-  :on-unfocus - Function called when unfocusing.
-  :render - If non-nil, rerender the element when focused/unfocused.
-
-All functions are called with one argument, which is the value of
-`lens-ui-focused'.")
-
-(defun lens--focused-post-command ()
-  (if (null lens-ui-focused) (lens-ui-unfocus)
-
-    (let ((element (plist-get lens-ui-focused :element)))
-      (plist-put lens-ui-focused :location
-                 (lens--ui-find-element (car element) (cdr element)))
-      (let* ((fn (or (plist-get lens-ui-focused :update) #'ignore))
-             (stay-focused (with-demoted-errors "Error fixing focus: %s"
-                             (funcall fn lens-ui-focused))))
-        (if stay-focused
-            (plist-put lens-ui-focused :last-point (point))
-          (lens-ui-unfocus))))))
-
-(cl-defun lens--use-focusable (&rest plist)
-  "Make the current element focusable.
-
-See `lens-ui-focused' for a list of valid properties for PLIST."
-
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         hook)
-
-    ;; Ensure that there are no other :use-focusable hooks
-    (and (plist-get ctx :is-first-call)
-         (--any (eq (car it) :use-focusable) (plist-get (plist-get ctx :state) :hooks))
-         (error "You can only have one :use-focusable hook per element"))
-
-    (setq hook (lens--register-hook ctx :use-focusable nil))
-    (setf (cddr hook) plist)
-
-    ;; Set the first argument to be whether it is focused
-    (setf (cadr hook)
-          (when lens-ui-focused
-            (let ((elem (plist-get lens-ui-focused :element)))
-              (and (eq (car elem) (plist-get ctx :root-state))
-                   (equal (cdr elem) (plist-get ctx :path))))))
-    (cadr hook)))
-
-(defun lens--perform-focus-change (element focus unfocus)
-  (let ((fn #'(lambda (focus unfocus)
-                (when-let ((on-focus (plist-get focus :on-focus)))
-                  (with-demoted-errors "Error in focus: %s"
-                    (funcall on-focus focus)))
-                (when-let ((on-unfocus (plist-get unfocus :on-unfocus)))
-                  (with-demoted-errors "Error in unfocus: %s"
-                    (funcall on-unfocus unfocus))))))
-
-    (if (or (plist-get focus :render) (plist-get unfocus :render))
-        (lens--perform-callback-internal (car element) fn (list focus unfocus))
-      (funcall fn focus unfocus))))
-
-(defun lens-ui-unfocus ()
-  "Unfocus the focused element."
+(defun lens-auto-insert-all ()
+  "Insert lenses for all auto-lens matches in the current buffer."
   (interactive)
-  (let ((old lens-ui-focused))
-    (setq lens-ui-focused nil)
-    (remove-hook 'post-command-hook #'lens--focused-post-command t)
-    (when old (lens--perform-focus-change (plist-get old :element) nil old))))
-
-(defun lens-ui-focus (ctx &rest relative-path)
-  "Focus the element at RELATIVE-PATH relative to CTX.
-
-For example, if RELATIVE-PATH is nil, this will focus the current
-element. If RELATIVE-PATH is (:a) it will focus the child with key :a.
-The element being focused must have a :use-focusable hook."
-  (let* ((path (append (plist-get ctx :path) relative-path))
-         (elem-state (or (lens--follow-key-path (plist-get ctx :state) relative-path)
-                         (error "Unable to focus element %s: Not found" path)))
-         (hook (or (--find (eq (car it) :use-focusable) (plist-get elem-state :hooks))
-                   (error "Unable to focus element %s: Not focusable" path)))
-         (plist (cddr hook))
-         (element (cons (plist-get ctx :root-state) path))
-         (old-focused lens-ui-focused)
-         (old-element (plist-get old-focused :element))
-         new-focused)
-
-    (unless (equal element old-element)
-      (setq new-focused
-            (apply #'list
-                   :element element
-                   :last-point (point)
-                   :location (lens--ui-find-element (car element) (cdr element))
-                   plist))
-
-      (setq lens-ui-focused (when (plist-get plist :update) new-focused))
-      (if lens-ui-focused
-          (add-hook 'post-command-hook #'lens--focused-post-command nil t)
-        (remove-hook 'post-command-hook #'lens--focused-post-command t))
-
-      (if (eq (car element) (car old-element))
-          ;; different path in same state -- perform a single focus change for both
-          (lens--perform-focus-change element new-focused old-focused)
-        ;; old state != new state -- perform an unfocus then a focus
-        (when old-element (lens--perform-focus-change old-element nil old-focused))
-        (lens--perform-focus-change element new-focused nil)))))
-
-
-;;;; Use callback
-
-(defvar lens--callback-state nil
-  "A copy of the root-level state of the ui, which should be mutated.")
-
-(defun lens--use-callback (name cb)
-  "Register a :use-callback hook.
-
-\(:use-callback NAME CALLBACK SYMBOL)
-
-Where SYMBOL is a custom symbol whose function value is set to call this
-hook. This function returns SYMBOL."
-
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         (root-state (plist-get ctx :root-state))
-         (ui-id (plist-get root-state :ui-id))
-         (path (plist-get ctx :path))
-         (hook
-          (lens--register-hook ctx :use-callback
-            name cb
-            (let* ((str (cl-loop for sym in path
-                                 concat (symbol-name sym) into str
-                                 finally return (format "lens-%s%s:%s" ui-id str name)))
-                   (ret-symbol (make-symbol str)))
-              (fset ret-symbol
-                    `(lambda (&rest args)
-                       (interactive)
-                       (lens--perform-callback ',root-state ',path ',name args)))
-              ret-symbol))))
-    (setf (caddr hook) cb)
-    (nth 3 hook)))
-
-(defun lens--follow-key-path (state path)
-  (if (null path) state
-    (lens--follow-key-path
-     (or (alist-get (car path) (plist-get state :content))
-         (error "Invalid component key path"))
-     (cdr path))))
-
-(defun lens--perform-callback-internal (state callback args)
-  (if lens--callback-state
-      (apply callback args)
-
-    ;; This is the root-level callback, so we need to handle updating the lens
-    (let (old-rows region)
-      (with-current-buffer (plist-get state :buffer)
-        (save-excursion
-          (goto-char (point-min))
-
-          (or (text-property-search-forward
-               'lens-begin state
-               #'(lambda (st lens) (eq st (car (caddr lens)))))
-              (error "Lens not found"))
-
-          (setq region (lens-at-point)))
-        (setq old-rows (lens--ui-string-rows state nil))
-
-        ;; Since we specifically searched for a lens with the correct state,
-        ;; this should never be an issue, but check just in case
-        (unless (eq (car (caddr (car region))) state)
-          (error "Lens at point is for the incorrect state"))
-
-        ;; Update the actual state based on the buffer state
-        (when (lens--propogate-buffer-state state (cdr (caddr (car region))))
-          (message "Detected buffer state change, pre-regenerating ui!")
-          (lens--generate-ui (plist-get state :ui-func) nil
-                             state state))
-
-        (let ((lens--callback-state state))
-          (apply callback args))
-
-        (lens--generate-ui (plist-get state :ui-func) nil
-                           state state)
-
-        (lens-modify region (cons state (lens--collect-buffer-states state nil)) nil
-                     (lambda (he fb) (lens--ui-renderer state old-rows he fb)))
-
-        (lens--ui-run-effects state)
-
-        (when lens-ui-focused
-          (plist-put lens-ui-focused :last-point (point)))))))
-
-(defun lens--perform-callback (state path name args)
-  "Perform a named callback.
-
-STATE is the root ui state. PATH is the path to the component containing
-the callback. NAME is the name of the callback."
-
-  ;; Find the correct function to call
-  (let* ((nested-state (lens--follow-key-path state path))
-         (hook (or (--find (and (eq (car it) :use-callback)
-                                (eq (cadr it) name))
-                           (plist-get nested-state :hooks))
-                   (error "Callback not found %s %s" path name))))
-
-    ;; If this is a callback called from within another callback
-    (lens--perform-callback-internal state (caddr hook) args)))
-
-
-;;;; Use state
-
-(defun lens--use-state-callback (path hook-idx value)
-  (let* ((root-state (or lens--callback-state
-                         (error "Called set-state outside of a ui callback")))
-         (nested-state (lens--follow-key-path root-state path))
-         (hooks (plist-get nested-state :hooks))
-         (hook (nth hook-idx hooks)))
-    (setf (cadr hook) value)))
-
-(defun lens--use-state (initial)
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         (hook-idx (plist-get ctx :hook-idx))
-         (path (plist-get ctx :path))
-         (hook (lens--register-hook ctx :use-state initial))
-         (value (cadr hook)))
-    (cons value (lambda (value) (lens--use-state-callback path hook-idx value)))))
-
-
-;;;; Use buffer state
-
-(defun lens--collect-buffer-states (state path)
-  (nconc (cl-loop for hook in (plist-get state :hooks)
-                  for hook-idx from 0
-                  when (eq (car hook) :use-buffer-state)
-                  collect (list path hook-idx (copy-tree (cadr hook))))
-         (when (listp (plist-get state :content))
-           (cl-loop for (key . child) in (plist-get state :content)
-                    nconc (lens--collect-buffer-states child (append path (list key)))))))
-
-(defun lens--propogate-buffer-state (state buffer-states)
-  "Update STATE with values from BUFFER-STATES.
-
-Returns non-nil if any state was changed."
-  (let ((any-changed nil))
-    (pcase-dolist (`(,path ,hook-idx ,value) buffer-states)
-      (when-let ((nested-state (lens--follow-key-path state path)))
-        (let ((hook (nth hook-idx (plist-get nested-state :hooks))))
-          (or (eq :use-buffer-state (car hook))
-              (error "Misplaced buffer state hook: %s %s" path hook-idx))
-          (unless (equal value (cadr hook))
-            (setf (cadr hook) value)
-            (setq any-changed t)))))
-    any-changed))
-
-(defun lens--use-buffer-state-callback (path hook-idx value)
-  "Set the buffer state VALUE for the hook at HOOK-IDX in component at PATH."
-  (let* ((root-state (or lens--callback-state
-                         (error "Called set-buffer-state outside of a ui callback")))
-         (nested-state (lens--follow-key-path root-state path))
-         (hooks (plist-get nested-state :hooks))
-         (hook (nth hook-idx hooks)))
-    (setf (cadr hook) value)))
-
-(defun lens--use-buffer-state (initial)
-  "Create a buffer state hook with INITIAL value.
-
-Buffer state is preserved in the undo history.
-Returns a cons of (VALUE . SETTER-FUNCTION)."
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         (hook-idx (plist-get ctx :hook-idx))
-         (path (plist-get ctx :path))
-         (hook (lens--register-hook ctx :use-buffer-state initial))
-         (value (cadr hook)))
-    (cons value (lambda (value) (lens--use-buffer-state-callback path hook-idx value)))))
-
-
-;;;; Use effect
-
-(defun lens--ui-run-effects (state &optional key-path)
-  "Run all pending use-effect hooks in STATE and its children.
-
-KEY-PATH is the current path in the component tree."
-  ;; Run effects for sub elements
-  (let ((children (plist-get state :content)))
-    (when (listp children)
-      (dolist (child children)
-        (lens--ui-run-effects (cdr child) (append key-path (list (car child)))))))
-  ;; Run effects for the current element
-  (dolist (hook (plist-get state :hooks))
-    (when (and (eq (car hook) :use-effect)
-               (nth 3 hook))
-      (funcall (cadr hook)))))
-
-(defun lens--use-effect (dependencies effect)
-  "Define a use-effect hook.
-
-The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
-values of the dependencies. 3. Whether the callback should be called on
-this particular render.
-
-The 3rd parameter is t if this is the first render, or if the
-dependencies changed since the last render."
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         (hook (lens--register-hook ctx :use-effect
-                 effect (not dependencies) t)))
-
-    ;; Set the callback to the new callback
-    (setf (cadr hook) effect)
-    ;; Check if the dependencies have changed
-    (if (equal dependencies (caddr hook))
-        (setf (nth 3 hook) nil)
-      (setf (caddr hook) dependencies)
-      (setf (nth 3 hook) t))))
-
-
-;;;; Use memo
-
-(defun lens--use-memo (dependencies generator)
-  "Store a memoized value.
-
-GENERATOR is a 1-argument function which takes the old value and
-generates a new value. DEPENDENCIES is a list of values. The memo will
-be rerun when one of DEPENDENCIES changes."
-  (let* ((ctx (or lens--current-ctx (error "No containing lens context")))
-         (hook (lens--register-hook ctx :use-memo
-                 generator dependencies (funcall generator nil))))
-
-    ;; Set the generator to the new generator
-    (setf (cadr hook) generator)
-    ;; Check if the dependencies have changed
-    (unless (equal dependencies (caddr hook))
-      (setf (caddr hook) dependencies)
-      (setf (nth 3 hook) (funcall generator (nth 3 hook))))
-    (nth 3 hook)))
-
-
-;;;; Use text properties
-
-(defun lens--use-text-properties (properties)
-  "Set additional text properties for the entire region."
-  (let ((ctx (or lens--current-ctx (error "No containing lens context"))))
-    (lens--use-effect
-     (random)
-     (lambda ()
-       (save-excursion
-         (pcase-let ((`(,start . ,end) (lens--ui-find-ctx-element ctx))
-                     (ps properties)
-                     (prop nil) (value nil))
-           (lens-silent-edit
-            (while ps
-              (setq prop (pop ps) value (pop ps))
-              (pcase prop
-                ('face (add-face-text-property start end value t))
-                ('keymap
-                 (alter-text-property
-                  start end 'keymap
-                  (lambda (existing)
-                    ;; If the keymap is already in the existing, do nothing
-                    (cond ((or (eq existing value) (memq value (cdr existing))) existing)
-                          ;; If the existing is already a list of keymaps, prepend
-                          ((and (keymapp existing) (ignore-errors (-every #'keymapp (cdr existing))))
-                           `(keymap ,@(cdr existing) value))
-                          ;; If there is already a keymap, create one combining the two
-                          (existing (list 'keymap existing value))
-                          (value)))))
-                (_ (put-text-property start end prop value)))))))))))
-
-
-;;;; Ui display
-
-(defun lens-ui-display (ui-func)
-  "Display spec for custom ui definitions.
-
-UI is a function which takes a ui context and returns a list of
-components.
-
-Each component has \"component state,\" which is a plist with the
-following properties:
-  :hooks - A list of hooks called in the component, in order. Each call
-    must have the same hooks and order. Each hook has the
-    format (HOOK-KEYWORD ARGS...).
-  :content - An alist from keys to child component states, or a string
-  :renderer? - When :content is an alist, this is a function which takes
-    the insert strings of each of the child components, and returns the
-    insert string of the current component.
-
-The \"ui state\" is the state for the root component, along with the
-following properties:
-  :original-text - The original input text that the ui was created with
-  :ui-id - Unique id for this ui
-
-The display state is a cons cell, (UI-STATE . LOCAL-STATE). The way that
-lenses work, is that the state of each version of a lens must be a
-different object, so that we can move through the history. It would be
-costly to store an entire copy of the entire ui state for every time
-stamp. Thus, the UI-STATE is mutated, and its value shared between all
-versions of the lens, whereas LOCAL-STATE store the time-dependenet
-aspects of the lens which are copied for every version.
-
-Specifically, LOCAL-STATE is an alist of path symbols to the state
-values. If you have a call (:use-local-state count set-count 10) in the
-component (:root :column), then the alist would look like
-
-\((:root:column:0 . 10))
-
-where :root:column:count is a single symbol. The path symbol is equal to
-the child keys concatenated with the index of the :use-local-state
-hook among all hooks in the current component."
-
-  (let ((ui-id (abs (random))))
-    (list :tostate
-          (lambda (text)
-            (let* ((state (list
-                           :original-text text
-                           :ui-id ui-id
-                           :buffer (current-buffer)
-                           :ui-func ui-func)))
-              (cons (lens--generate-ui ui-func nil nil state)
-                    (lens--collect-buffer-states state nil))))
-          :totext (lambda (state) (plist-get state :text))
-          :insert
-          (lambda (state)
-            (run-with-timer 0 nil #'lens--ui-run-effects (car state))
-            (concat (propertize "\n" 'lens-element-key 'START)
-                    (lens--ui-state-to-string (car state)))))))
-
-
-;;;; Defui
-
-(defvar lens-ui-alist nil)
-
-(defmacro lens-ui-body (&rest body)
-  `(lens-let-body
-    [(:use-callback
-       lambda (body name &rest cb)
-       (when (and (> (length cb) 1) (not (and (listp (car cb)) (-every #'symbolp (car cb)))))
-         (error "If :use-callback has more than 2 arguments, the second must be an argument list"))
-       `((let* ((cb ,(if (eq (length cb) 1) (car cb) (cons #'lambda cb)))
-                (,name (lens--use-callback ',name cb)))
-           ,@body)))
-     (:use-state
-      lambda (body state-var set-var initial)
-      (unless (symbolp state-var) (error "First argument to :use-state must be a variable symbol"))
-      (unless (symbolp set-var) (error "Second argument to :use-state must be a function symbol"))
-      `((let* ((=use-state= (lens--use-state ,initial))
-               (,state-var (car =use-state=))
-               (,set-var (cdr =use-state=)))
-          (cl-flet ((,set-var ,set-var))
-            ,@body))))
-     (:use-buffer-state
-      lambda (body state-var set-var initial)
-      (unless (symbolp state-var) (error "First argument to :use-buffer-state must be a variable symbol"))
-      (unless (symbolp set-var) (error "Second argument to :use-buffer-state must be a function symbol"))
-      `((let* ((=use-state= (lens--use-buffer-state ,initial))
-               (,state-var (car =use-state=))
-               (,set-var (cdr =use-state=)))
-          (cl-flet ((,set-var ,set-var))
-            ,@body))))
-     (:use-memo
-      lambda (body var deps &rest cb-body)
-      (unless (symbolp var) (error "First argument to :use-memo must be a variable symbol"))
-      (unless (vectorp deps) (error "Second argument to :use-memo must be a dependency vector"))
-      `((let ((,var (lens--use-memo (list ,@deps ,@nil) (lambda (,var) (ignore ,var) ,@cb-body))))
-          ,@body)))
-     (:use-effect
-      lambda (body deps &rest cb-body)
-      (unless (vectorp deps) (error "First argument to :use-effect must be a dependency vector"))
-      `((lens--use-effect (list ,@deps ,@nil) (lambda () ,@cb-body))
-        ,@body))
-     (:use-text-properties
-      lambda (body &rest properties)
-      `((lens--use-text-properties ,(cons #'list properties))
-        ,@body))
-     (:use-renderer
-      lambda (body ctx renderer)
-      (let ((ctx-expr '(or lens--current-ctx (error "No containing lens context"))))
-        (cons `(plist-put (plist-get ,ctx-expr :state) :renderer ,renderer) body)))
-     (:use-focusable
-      lambda (body var &rest plist)
-      `((let ((,var (lens--use-focusable ,@plist)))
-          ,@body)))]
-    ,@body))
-
-(defmacro lens-defui (name arglist &rest body)
-  (declare (indent 2))
-  `(setf (alist-get ',name lens-ui-alist)
-         (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name))))
-
-
-;;;; Components
-
-(defmacro lens-defcomponent (name arglist &rest body)
-  "Define a UI component."
-  (declare (indent 2))
-
-  ;; Parse the beginning of the body as properties
-  (let ((props nil))
-    (while (keywordp (car body))
-      (push (cons (pop body) (pop body)) props))
-
-    (apply #'list #'prog1
-           `(put ',name 'lens-component
-                 (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name)))
-           (--map `(put ',name
-                        ',(intern (concat "lens-component-"
-                                          (substring (symbol-name (car it)) 1)))
-                        ,(cdr it))
-                  props))))
-
-(lens-defcomponent field (_ctx text onchange &rest plist)
-  (lens--field text
-               (lambda (new _cursor)
-                 (funcall onchange new))
-               (or (plist-get plist :header) "[begin box]\n")
-               (or (plist-get plist :footer) "\n[end box]")))
-
-(lens-defcomponent string (_ctx str)
-  :can-be-column t
-  (propertize (if (stringp str) str (string-join str "\n"))
-              'read-only t))
-
-
-;;;; Button
-
-(defface lens-button '((t :inherit custom-button))
-  "Face for lens buttons.")
-
-(defvar lens-button-map
-  (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "<return>") #'lens-click)
-    m)
-  "Keymap local to buttons.")
-
-(defun lens-click ()
-  "If there is a ui button at point, call its onclick function."
+  (let (assoc end)
+    (save-excursion
+      (lens-remove-all)
+      (goto-char (point-min))
+      (while (setq assoc (lens-auto-search-forward))
+        (setq end (match-end 0))
+        (funcall (cadr assoc))
+        (goto-char end)))))
+
+(defun lens-auto-at-point ()
+  "Insert an auto-lens at point if one matches."
   (interactive)
-  (let ((click (get-text-property (point) 'lens-click)))
-    (if click (funcall click)
-      (error "Nothing to click"))))
-
-(lens-defcomponent button (_ctx label onclick &key face)
-  :can-be-column t
-  (propertize (format " %s " label)
-              'lens-click onclick
-              'keymap lens-button-map
-              'face (or face 'lens-button)
-              'font-lock-face (or face 'lens-button)
-              'read-only t))
-
-
-;;;; Columns
-
-(defun lens--join-columns (cols &optional sep)
-  "Vertically align a list of strings as columns.
-
-COLS is the list of strings to align, and SEP is an additional
-string to insert between the columns."
-  (let* ((splits (--map (split-string (replace-regexp-in-string "\n\\'" "" it) "\n") cols))
-         (line-ct (apply #'max (-map #'length splits)))
-         (lines (make-list line-ct ""))
-         max-w cell-text)
-    (dolist (col-lines splits)
-      (setq max-w (apply #'max (-map #'lens-string-width col-lines)))
-
-      (dotimes (i line-ct)
-        (setq cell-text (or (nth i col-lines) ""))
-        (setf (nth i lines)
-              (concat (nth i lines)
-                      (or (unless (eq col-lines (car splits)) sep) "")
-                      cell-text
-                      (make-string (- max-w (lens-string-width cell-text)) ?\s)))))
-    (string-join lines (propertize "\n" 'read-only t))))
-
-(lens-defcomponent columns (_ctx &rest columns)
-  ;; Ensure that all are valid columns
-  (dolist (elem columns)
-    (unless (get (car elem) 'lens-component-can-be-column)
-      (error "Invalid column component: %s" (car elem))))
-
-  (:use-renderer ctx (lambda (cols) (lens--join-columns cols (propertize " " 'read-only t))))
-  columns)
-
-(lens-defcomponent rows (_ctx &rest rows)
-  :can-be-column t
-  rows)
+  (let ((target (point))
+        done assoc)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not done)
+        (setq assoc (lens-auto-search-forward))
+        (cond
+         ;; If we have passed the target position
+         ((or (null assoc) (> (match-beginning 0) target)) (error "No auto lens at point"))
+         ;; If we have not yet reached the target position
+         ((< (match-end 0) target) (goto-char (match-end 0)))
+         ;; If we have found a lens containing the target position
+         (t (funcall (cadr assoc)) (setq done t)))))))
 
 
-;;;; Text field
-
-(lens-defcomponent text-field (_ctx text set-text &key header footer props)
-  (:use-callback onchange (newtext _newcursor)
-                 (funcall set-text newtext))
-
-  (setq header (propertize (or header "[begin field]\n") 'face 'lens-field-header))
-  (setq footer (apply #'propertize (or footer "\n[end field]") 'face 'lens-field-header props))
-
-  (:use-focusable _focused?
-                  :on-focus
-                  #'(lambda (ps)
-                      (goto-char (- (cdr (plist-get ps :location))
-                                    (length footer) -1))))
-
-  (lens--field text onchange header footer props))
-
-
-;;;; Text box
-
-(lens-defcomponent text-box (ctx text set-text &key onenter width)
-  :can-be-column t
-
-  (:use-state cursor set-cursor nil)
-
-  (:use-state unique-id _set-unique-id (random))
-  (:use-focusable focused?
-                  :render t
-                  :info (list unique-id)
-                  :update #'lens--border-box-update-cursor
-                  :on-focus (lambda (_) (run-hook-with-args 'lens-box-enter-hook))
-                  :on-unfocus (lambda (_) (run-hook-with-args 'lens-box-exit-hook)))
-
-  ;; The real value to use for the cursor
-  (setq cursor (when focused? (min (or cursor (length text)) (length text))))
-
-  (:let border-face 'lens-field-header)
-
-  (:pcase-let `(,body ,header ,footer ,cursor-line, cursor-col)
-              (lens--textbox-wrap
-               text :width (or width 30)
-               :cursor cursor
-               :box-props `(lens-textbox-border t read-only t face ,border-face)
-               :title (if focused? "Esc to unfocus" "Enter to focus")
-               :charset 'unicode))
-
-  (:use-callback focus () (lens-ui-focus ctx))
-  (:use-callback unfocus () (lens-ui-unfocus))
-
-  ;; Update the cursor at the end
-  (:use-effect
-   [focused? cursor-line cursor-col]
-   (when (and focused? cursor-line cursor-col)
-     (lens--ui-find-ctx-element ctx)
-     (forward-line (1+ cursor-line))
-     (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-     (forward-char cursor-col)))
-
-  (:use-callback
-    change-cb (newtext newcursor line-idx)
-    (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
-      (funcall set-text (car res))
-      (set-cursor (cdr res))))
-
-  (:use-memo focused-map [onenter] `(keymap (escape . ,unfocus) (return . ,onenter)))
-  (:use-memo unfocused-map [] `(keymap (return . ,focus)))
-  (:use-text-properties 'keymap (if focused? focused-map unfocused-map))
-
-  (string-join
-   (nconc (list (substring header 0 -1))
-          (cl-loop for (content prefix suffix) in body and line-idx upfrom 0
-                   for bol-char = (propertize "~" 'lens-border-box-bol unique-id 'rear-nonsticky t 'face border-face
-                                              'read-only (eq line-idx 0))
-                   for eol-char = (propertize "~" 'lens-border-box-eol unique-id 'read-only t 'face border-face)
-                   collect
-                   (lens--field
-                    (concat bol-char (propertize content 'lens-border-box-content unique-id) eol-char)
-                    (let ((scoped-line-idx line-idx))
-                      (lambda (newtext newcursor)
-                        (funcall change-cb newtext newcursor scoped-line-idx)))
-                    (substring prefix 0 -1)
-                    (substring suffix 1 -1)
-                    (unless focused? (list 'face border-face 'read-only t))))
-          (list footer))
-   (propertize "\n" 'read-only t)))
-
-(defcustom lens-box-enter-hook nil
-  "Hook run after entering a box."
-  :group 'lens
-  :type 'hook)
-
-(defcustom lens-box-exit-hook nil
-  "Hook run after exiting a box."
-  :group 'lens
-  :type 'hook)
-
-(cl-defun lens--border-box-update-cursor ((&key info last-point &allow-other-keys))
-  (let ((cur-line (line-number-at-pos))
-        (unique-id (car info)))
-
-    (or (eq last-point (point))
-        (eq (get-text-property (point) 'lens-border-box-content) unique-id)
-        ;; Do not run if a modification was made
-        (memq #'lens--field-modification-callback (default-value 'post-command-hook))
-        ;; If we moved horizontally off of the line, go to the previous/next line
-        (if (eq cur-line (line-number-at-pos last-point))
-            (if (< (point) last-point)
-                (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-              (or (text-property-search-forward 'lens-border-box-bol unique-id #'eq)
-                  ;; The cursor is allowed to be at the end of the last line
-                  (eq (get-text-property (1- (point)) 'lens-border-box-content) unique-id)))
-          ;; If we moved to a different line, try to find the end of the line
-          (goto-char (pos-eol))
-          (and (text-property-search-backward 'lens-border-box-eol unique-id #'eq)
-               ;; If we went off the end of the textbox
-               (eq cur-line (line-number-at-pos))))
-        ;; If everything else failed, go back to the last known position
-        (when (eq (or (get-text-property last-point 'lens-border-box-content)
-                      (get-text-property last-point 'lens-border-box-eol))
-                  unique-id)
-          (goto-char last-point)
-          (message "Press ESC to exit the textbox")
-          t))))
-
-(defun lens--border-box-callback (body line-idx new-line-text cursor-col)
-  "Process a modification to a border box.
-
-BODY is the list of lines, LINE-IDX is the modified line index,
-NEW-LINE-TEXT is the new text, and CURSOR-COL is the cursor column.
-Returns (NEW-CONTENT . NEW-CURSOR)."
-  (let ((new-content "")
-        deleted-bol new-cursor line)
-
-    (dotimes (i (length body))
-
-      ;; If the user deleted the BOL character, delete a character from the previous line
-      (setq deleted-bol (and (eq i line-idx)
-                             (not (get-text-property 0 'lens-border-box-bol new-line-text))))
-      (when (and deleted-bol (not (s-blank? new-content)))
-        (setq new-content (substring new-content 0 -1)))
-      (setq line (if (eq i line-idx)
-                     (substring new-line-text (if deleted-bol 0 1) -1)
-                   (car (nth i body))))
-
-      ;; Subtract 1 from the cursor col to account for the ~ prefix
-      (when (= i line-idx) (setq new-cursor (+ (length new-content) cursor-col
-                                               (if deleted-bol 0 -1))))
-
-      ;; Concat the line to the new content
-      (if (and (not (s-blank? line))
-               (get-text-property (1- (length line)) 'lens-textbox-newline line))
-          (setq new-content (concat new-content (substring line 0 -1) "\n"))
-        (setq new-content (concat new-content line))))
-
-    (cons new-content new-cursor)))
-
-
-;;; Usable functions
-;;;; Ui Functions
-
-(defun lens-read-ui (&optional prompt)
-  "Prompt the user to select a UI from `lens-ui-alist'.
-
-PROMPT is the prompt string to display."
-  (let ((name (completing-read (or prompt "Ui: ") (mapcar #'car lens-ui-alist))))
-    (alist-get (intern name) lens-ui-alist)))
-
-
-(defun lens--replace-create (beg end src-func display)
-  "Replace region from BEG to END with a new lens.
-
-SRC-FUNC is called with the region text to create the source.
-DISPLAY is the display specification for the lens."
-  (let ((str (buffer-substring-no-properties beg end)))
-    (lens-silent-edit
-     (delete-region beg end)
-     (lens-create (funcall src-func str) display))))
-
-(defun lens--wrapped-create (hb he fb fe src-func display)
-  "Create a lens from a wrapped region with header and footer.
-
-HB, HE, FB, FE are the bounds of the header and footer.
-SRC-FUNC is called with (BODY HEAD FOOT) to create the source.
-DISPLAY is the display specification for the lens."
-  (let ((head (buffer-substring-no-properties hb he))
-        (body (buffer-substring-no-properties he fb))
-        (foot (buffer-substring-no-properties fb fe)))
-    (lens-silent-edit
-     (delete-region hb fe)
-     (lens-create (funcall src-func body head foot) display))))
-
-
-;;;; Creation Functions
-
-(defun lens-create-buffer (beg end buffer)
-  "Create a lens displaying BUFFER, replacing region from BEG to END."
-  (interactive (list (point) (if mark-active (mark) (point)) (read-buffer "Buffer: ")))
-  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-raw-display)))
-
-(defun lens-create-file (beg end file)
-  "Create a lens displaying FILE, replacing region from BEG to END."
-  (interactive (list (point) (if mark-active (mark) (point)) (read-file-name "File: ")))
-  (lens--replace-create beg end (lambda (str) (lens-file-source file str)) (lens-raw-display)))
-
-(defun lens-create-ui (beg end ui)
-  "Create a lens with UI display, replacing region from BEG to END."
-  (interactive (list (point) (if mark-active (mark) (point))
-                     (or (lens-read-ui) (error "No ui selected"))))
-  (lens--replace-create beg end #'lens-replace-source (lens-ui-display ui)))
-
-(defun lens-create-buffer-ui (beg end buffer ui)
-  "Create a lens displaying BUFFER with UI, replacing region from BEG to END."
-  (interactive (list (point) (if mark-active (mark) (point))
-                     (read-buffer "Buffer: ") (lens-read-ui)))
-  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-ui-display ui)))
-
-(defun lens-create-new-file (path)
-  "Create a new file at PATH and insert a lens displaying it."
-  (interactive (list (read-file-name "Create Lens: " "lenses/")))
-
-  (let* ((rel1 (f-relative path (f-parent buffer-file-name)))
-         (rel (if (string-match-p "\\`[/~]" rel1) rel1 (concat "./" rel1)))
-         (link (format "[[%s]]\n" rel)))
-    (mkdir (f-parent path) t)
-    (f-touch path)
-    (find-file-noselect path t)
-    (lens-create (lens-file-source path link) (lens-raw-display))))
-
-
+;;; ============================================================
 ;;; Folding
 
 (defun lens-fold (region)
@@ -2167,8 +913,8 @@ DISPLAY is the display specification for the lens."
 (defun lens-fold-toggle (region)
   "Toggle whether the lens at REGION, or at point, is folded."
   (interactive (list (lens-at-point)))
-  (if (--find (eq (car region) (overlay-get it 'lens-fold))
-              (overlays-in (point-min) (point-max)))
+  (if (cl-loop for ol in (overlays-in (point-min) (point-max))
+               thereis (eq (car region) (overlay-get ol 'lens-fold)))
       (lens-unfold (car region))
     (lens-fold region)))
 
@@ -2179,7 +925,7 @@ If all overlays are folded, unfold all overlays. Otherwise, fold
 all overlays."
   (interactive)
   (let* ((os (overlays-in (point-min) (point-max)))
-         (lenses (-uniq (--map (overlay-get it 'lens-fold) os)))
+         (lenses (seq-uniq (cl-loop for ol in os collect (overlay-get ol 'lens-fold))))
          (all-folded t))
     (lens-run-on-all
      (lambda (region)
@@ -2190,108 +936,8 @@ all overlays."
       (lens-fold-all))))
 
 
-;;; Auto Mode
-;;;; Org Matchers
-
-(defvar lens-auto--org-block-re "^#\\+begin_lens \\([-_a-zA-Z0-9]+\\).*\n\\([^z-a]*?\\)\n#\\+end_lens\n")
-(defun lens-auto--org-block ()
-  "Create a lens from an org #+begin_lens block at the current match."
-  (let ((ui (alist-get (intern (match-string 1)) lens-ui-alist))
-        (hb (match-beginning 0)) (he (match-beginning 2))
-        (fb (match-end 2)) (fe (match-end 0)))
-    (when ui (lens--wrapped-create hb he fb fe #'lens-replace-source (lens-ui-display ui)))))
-
-
-(defun lens--org-forward-filter (text)
-  "Escape org headings in TEXT by wrapping them in underscores."
-  (replace-regexp-in-string "^\\*+ .*$" "_\\&_" text))
-
-(defun lens--org-backward-filter (text)
-  "Unescape org headings in TEXT by removing surrounding underscores."
-  (replace-regexp-in-string "^_\\(\\*+ .*\\)_$" "\\1" text))
-
-(defvar lens-auto--org-link-re (format "^\\(?:%s\\)\n" org-link-any-re))
-(defun lens-auto--org-file-link ()
-  "Create a lens from an org file link at the current match."
-  (let* ((beg (match-beginning 0)) (end (match-end 0))
-         (context (org-element-context))
-         (link-type (and (eq (car context) 'link) (org-element-property :type context)))
-         (path (and link-type (string= link-type "file") (org-element-property :path context))))
-    (when path
-      (lens--replace-create beg end (lambda (str) (lens-file-source path str))
-                            (lens-raw-display #'lens--org-forward-filter
-                                              #'lens--org-backward-filter)))))
-
-
-(defvar lens-auto-matchers:org-mode
-  `((,lens-auto--org-link-re lens-auto--org-file-link)
-    (,lens-auto--org-block-re lens-auto--org-block)))
-
-
-;;;; Mode
-
-(defvar-local lens-auto-matchers nil
-  "Alist of a regexp to a function.")
-
-(defvar lens-auto-mode-alist
-  `((org-mode . ,lens-auto-matchers:org-mode))
-  "Alist of major modes to values of `lens-auto-matchers'.")
-
-(define-minor-mode lens-auto-mode
-  "Automatically create lenses based on regexps."
-  :global nil
-  :init-value nil
-  (if (not lens-auto-mode) (lens-remove-all)
-    (setq lens-auto-matchers (alist-get major-mode lens-auto-mode-alist))
-    (lens-auto-insert-all)))
-
-(defun lens-auto-search-forward ()
-  "Search forward for the next auto-lens match.
-
-Returns the matching entry from `lens-auto-matchers', or nil if none found."
-  (let ((init (point))
-        match-pos match-assoc)
-    (dolist (assoc lens-auto-matchers)
-      (goto-char init)
-      (and (re-search-forward (car assoc) nil :noerror)
-           (or (null match-pos) (< (match-beginning 0) match-pos))
-           (setq match-pos (match-beginning 0) match-assoc assoc)))
-    (when match-pos
-      (goto-char match-pos)
-      (looking-at (car match-assoc)) ;; Set the match data
-      match-assoc)))
-
-(defun lens-auto-insert-all ()
-  "Insert lenses for all auto-lens matches in the current buffer."
-  (interactive)
-  (let (assoc end)
-    (save-excursion
-      (lens-remove-all)
-      (goto-char (point-min))
-      (while (setq assoc (lens-auto-search-forward))
-        (setq end (match-end 0))
-        (funcall (cadr assoc))
-        (goto-char end)))))
-
-(defun lens-auto-at-point ()
-  "Insert an auto-lens at point if one matches."
-  (interactive)
-  (let ((target (point))
-        done assoc)
-    (save-excursion
-      (goto-char (point-min))
-      (while (not done)
-        (setq assoc (lens-auto-search-forward))
-        (cond
-         ;; If we have passed the target position
-         ((or (null assoc) (> (match-beginning 0) target)) (error "No auto lens at point"))
-         ;; If we have not yet reached the target position
-         ((< (match-end 0) target) (goto-char (match-end 0)))
-         ;; If we have found a lens containing the target position
-         (t (funcall (cadr assoc)) (setq done t)))))))
-
-
-;;; Boxes
+;;; ============================================================
+;;; Style
 
 (defface lens-box-overline '((t :overline "lightskyblue4"))
   "Face for lens box overline.")
@@ -2355,6 +1001,61 @@ Returns the matching entry from `lens-auto-matchers', or nil if none found."
   "Default style used for rendering lenses.")
 
 
-;;; lens.el ends here
+;;; ============================================================
+;;; Usable functions
+;;;; Helper functions
+
+(defun lens--replace-create (beg end src-func display)
+  "Replace region from BEG to END with a new lens.
+
+SRC-FUNC is called with the region text to create the source.
+DISPLAY is the display specification for the lens."
+  (let ((str (buffer-substring-no-properties beg end)))
+    (lens-silent-edit
+     (delete-region beg end)
+     (lens-create (funcall src-func str) display))))
+
+(defun lens--wrapped-create (hb he fb fe src-func display)
+  "Create a lens from a wrapped region with header and footer.
+
+HB, HE, FB, FE are the bounds of the header and footer.
+SRC-FUNC is called with (BODY HEAD FOOT) to create the source.
+DISPLAY is the display specification for the lens."
+  (let ((head (buffer-substring-no-properties hb he))
+        (body (buffer-substring-no-properties he fb))
+        (foot (buffer-substring-no-properties fb fe)))
+    (lens-silent-edit
+     (delete-region hb fe)
+     (lens-create (funcall src-func body head foot) display))))
+
+
+;;;; Creation functions
+
+(defun lens-create-buffer (beg end buffer)
+  "Create a lens displaying BUFFER, replacing region from BEG to END."
+  (interactive (list (point) (if mark-active (mark) (point)) (read-buffer "Buffer: ")))
+  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lens-raw-display)))
+
+(defun lens-create-file (beg end file)
+  "Create a lens displaying FILE, replacing region from BEG to END."
+  (interactive (list (point) (if mark-active (mark) (point)) (read-file-name "File: ")))
+  (lens--replace-create beg end (lambda (str) (lens-file-source file str)) (lens-raw-display)))
+
+(defun lens-create-new-file (path)
+  "Create a new file at PATH and insert a lens displaying it."
+  (interactive (list (read-file-name "Create Lens: " "lenses/")))
+
+  (let* ((rel1 (f-relative path (f-parent buffer-file-name)))
+         (rel (if (string-match-p "\\`[/~]" rel1) rel1 (concat "./" rel1)))
+         (link (format "[[%s]]\n" rel)))
+    (mkdir (f-parent path) t)
+    (f-touch path)
+    (find-file-noselect path t)
+    (lens-create (lens-file-source path link) (lens-raw-display))))
+
+
+;;; ============================================================
+;;; End
 
 (provide 'lens)
+;;; lens.el ends here
