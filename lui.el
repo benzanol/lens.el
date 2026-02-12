@@ -384,11 +384,406 @@ Returns (START . END)."
   (lui-find-element (plist-get ctx :root-state) (plist-get ctx :path)))
 
 
+;;;; Save position in ui
+
+(defmacro lui-save-position-in-ui (&rest body)
+  "Save the current position relative to the containing ui element."
+  `(let ((line (line-number-at-pos)) (col (current-column))
+         me ui-key ui-line region)
+     (save-excursion
+       (and
+        ;; Find the prop match at the end of the component
+        (setq me (text-property-search-forward 'lens-element-key))
+        ;; If the next prop match is a start, then we weren't inside of an element
+        (not (eq (prop-match-value me) 'START))
+        ;; Go to the prop match at the beginning of the component
+        (progn (forward-char -1)
+               (text-property-search-backward 'lens-element-key))
+        ;; We are inside of a component, so set the relevant values
+        (setq ui-line (- line (line-number-at-pos))
+              ui-key (prop-match-value me))))
+     ,@body
+     (if (and ui-key (setq region (lens-at-point))
+              (progn (goto-char (caddr region)) ; Go to the end of the lens header
+                     ;; Go to the end of the key region
+                     (text-property-search-forward 'lens-element-key ui-key #'equal))
+              ;; Go to the beginning of the key region
+              (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
+         (progn (forward-line ui-line)
+                (forward-char (min col (- (pos-eol) (point)))))
+       (goto-char (point-min))
+       (forward-line (1- line))
+       (forward-char (min col (- (pos-eol) (point)))))))
+
+
+;;; ============================================================
+;;; Hooks
+;;;; Hook helper macro
+
+(defvar lui--generate-ui-ctx nil)
+
+(defmacro lui--register-hook (ctx type &rest args)
+  (declare (indent 2))
+  `(let* ((state (plist-get ctx :state))
+          (hooks (plist-get state :hooks))
+          (hook-idx (plist-get ctx :hook-idx))
+          hook)
+
+     (if (plist-get ,ctx :is-first-call)
+         ;; Add a hook to the hooks list
+         (progn (cl-assert (eq (length hooks) hook-idx))
+                (setq hook (list ,type ,@args))
+                (plist-put state :hooks (nconc hooks (list hook))))
+       ;; Check if the indexed hook has the correct type
+       (setq hook (nth hook-idx hooks))
+       (unless hook (error "Called %s hook where no hook was previously" ,type))
+       (unless (eq (car hook) ,type)
+         (error "Called %s hook where %s hook was previously" ,type (car hook))))
+     (plist-put ctx :hook-idx (1+ hook-idx))
+     hook))
+
+
+;;;; Use focusable
+
+(defvar-local lui-focused nil
+  "The currently focused element in the current buffer.
+
+This is nil, or a plist representing the current focused element.
+
+The plist has the following internally managed properties:
+  :element - A cons cell (STATE . PATH) representing the current element.
+  :last-point - The position of the cursor after the previous command.
+  :location - A cons cell (START . END) representing the last known
+    start end end position of the focused element.
+
+It also can have any of the following properties specified by the
+use-focusable hook:
+  :update - A function called every time the cursor moves while the
+    element is focused. If it returns nil, then unfocus the element. If
+    this property is omited, then the element will be immediately
+    unfocused every time it is focused.
+  :on-focus - Function called when focusing.
+  :on-unfocus - Function called when unfocusing.
+  :render - If non-nil, rerender the element when focused/unfocused.
+
+All functions are called with one argument, which is the value of
+`lui-focused'.")
+
+(defun lui-find-focused (focused)
+  (let ((element (plist-get focused :element)))
+    (lui-find-element (car element) (cdr element))))
+
+(defun lui--focused-post-command ()
+  (if (null lui-focused) (lui-unfocus)
+
+    (unless (eq (point) (plist-get lui-focused :last-point))
+      (let* ((fn (or (plist-get lui-focused :update) #'ignore))
+             (stay-focused (with-demoted-errors "Error fixing focus: %s"
+                             (funcall fn lui-focused))))
+        (if stay-focused
+            (plist-put lui-focused :last-point (point))
+          (lui-unfocus))))))
+
+(cl-defun lui--use-focusable (&rest plist)
+  "Make the current element focusable.
+
+See `lui-focused' for a list of valid properties for PLIST."
+
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         hook)
+
+    ;; Ensure that there are no other :use-focusable hooks
+    (and (plist-get ctx :is-first-call)
+         (seq-find (lambda (h) (eq (car h) :use-focusable)) (plist-get (plist-get ctx :state) :hooks))
+         (error "You can only have one :use-focusable hook per element"))
+
+    (setq hook (lui--register-hook ctx :use-focusable nil))
+    (setf (cddr hook) plist)
+
+    ;; Set the first argument to be whether it is focused
+    (setf (cadr hook)
+          (when lui-focused
+            (let ((elem (plist-get lui-focused :element)))
+              (and (eq (car elem) (plist-get ctx :root-state))
+                   (equal (cdr elem) (plist-get ctx :path))))))
+    (cadr hook)))
+
+(defun lui--perform-focus-change (element focus unfocus)
+  (let ((fn #'(lambda (focus unfocus)
+                (when-let ((on-focus (plist-get focus :on-focus)))
+                  (with-demoted-errors "Error in focus: %s"
+                    (funcall on-focus focus)))
+                (when-let ((on-unfocus (plist-get unfocus :on-unfocus)))
+                  (with-demoted-errors "Error in unfocus: %s"
+                    (funcall on-unfocus unfocus))))))
+
+    (if (or (plist-get focus :render) (plist-get unfocus :render))
+        (lui-modify (car element) fn (list focus unfocus))
+      (funcall fn focus unfocus))))
+
+(defun lui-unfocus ()
+  "Unfocus the focused element."
+  (interactive)
+  (let ((old lui-focused))
+    (setq lui-focused nil)
+    (remove-hook 'post-command-hook #'lui--focused-post-command t)
+    (when old (lui--perform-focus-change (plist-get old :element) nil old))))
+
+(defun lui-focus (ctx &rest relative-path)
+  "Focus the element at RELATIVE-PATH relative to CTX.
+
+For example, if RELATIVE-PATH is nil, this will focus the current
+element. If RELATIVE-PATH is (:a) it will focus the child with key :a.
+The element being focused must have a :use-focusable hook."
+  (let* ((path (append (plist-get ctx :path) relative-path))
+         (elem-state (or (lui--follow-key-path (plist-get ctx :state) relative-path)
+                         (error "Unable to focus element %s: Not found" path)))
+         (hook (or (seq-find (lambda (h) (eq (car h) :use-focusable)) (plist-get elem-state :hooks))
+                   (error "Unable to focus element %s: Not focusable" path)))
+         (plist (cddr hook))
+         (element (cons (plist-get ctx :root-state) path))
+         (old-focused lui-focused)
+         (old-element (plist-get old-focused :element))
+         new-focused)
+
+    (unless (equal element old-element)
+      (setq new-focused
+            (apply #'list
+                   :element element
+                   :last-point (point)
+                   :location (lui-find-element (car element) (cdr element))
+                   plist))
+
+      (setq lui-focused (when (plist-get plist :update) new-focused))
+      (if lui-focused
+          (add-hook 'post-command-hook #'lui--focused-post-command nil t)
+        (remove-hook 'post-command-hook #'lui--focused-post-command t))
+
+      (if (eq (car element) (car old-element))
+          ;; different path in same state -- perform a single focus change for both
+          (lui--perform-focus-change element new-focused old-focused)
+        ;; old state != new state -- perform an unfocus then a focus
+        (when old-element (lui--perform-focus-change old-element nil old-focused))
+        (lui--perform-focus-change element new-focused nil)))))
+
+
+;;;; Use callback
+
+(defvar lui--modification-state nil
+  "A copy of the ui state which is to be mutated by a callback.")
+
+(defun lui--use-callback (name cb)
+  "Register a :use-callback hook.
+
+\(:use-callback NAME CALLBACK SYMBOL)
+
+Where SYMBOL is a custom symbol whose function value is set to call this
+hook. This function returns SYMBOL."
+
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         (root-state (plist-get ctx :root-state))
+         (ui-id (plist-get root-state :ui-id))
+         (path (plist-get ctx :path))
+         (hook
+          (lui--register-hook ctx :use-callback
+            name cb
+            (let* ((str (cl-loop for sym in path
+                                 concat (symbol-name sym) into str
+                                 finally return (format "lens-%s%s:%s" ui-id str name)))
+                   (ret-symbol (make-symbol str)))
+              (fset ret-symbol
+                    `(lambda (&rest args)
+                       (interactive)
+                       (lui--perform-callback ',root-state ',path ',name args)))
+              ret-symbol))))
+    (setf (caddr hook) cb)
+    (nth 3 hook)))
+
+(defun lui--follow-key-path (state path)
+  (if (null path) state
+    (lui--follow-key-path
+     (or (alist-get (car path) (plist-get state :content))
+         (error "Invalid component key path"))
+     (cdr path))))
+
+(defun lui--perform-callback (state path name args)
+  "Perform a named callback.
+
+STATE is the root ui state. PATH is the path to the component containing
+the callback. NAME is the name of the callback."
+
+  ;; Find the correct function to call
+  (let* ((nested-state (lui--follow-key-path state path))
+         (hook (or (seq-find (lambda (h) (and (eq (car h) :use-callback) (eq (cadr h) name)))
+                             (plist-get nested-state :hooks))
+                   (error "Callback not found %s %s" path name))))
+
+    ;; If this is a callback called from within another callback
+    (lui-modify state (caddr hook) args)))
+
+
+;;;; Use state
+
+(defun lui--use-state-callback (path hook-idx value)
+  (let* ((root-state (or lui--modification-state
+                         (error "Called set-state outside of a ui callback")))
+         (nested-state (lui--follow-key-path root-state path))
+         (hooks (plist-get nested-state :hooks))
+         (hook (nth hook-idx hooks)))
+    (setf (cadr hook) value)))
+
+(defun lui--use-state (initial)
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         (hook-idx (plist-get ctx :hook-idx))
+         (path (plist-get ctx :path))
+         (hook (lui--register-hook ctx :use-state initial))
+         (value (cadr hook)))
+    (cons value (lambda (value) (lui--use-state-callback path hook-idx value)))))
+
+
+;;;; Use buffer state
+
+(defun lui--collect-buffer-states (state path)
+  (nconc (cl-loop for hook in (plist-get state :hooks)
+                  for hook-idx from 0
+                  when (eq (car hook) :use-buffer-state)
+                  collect (list path hook-idx (copy-tree (cadr hook))))
+         (when (listp (plist-get state :content))
+           (cl-loop for (key . child) in (plist-get state :content)
+                    nconc (lui--collect-buffer-states child (append path (list key)))))))
+
+(defun lui--propogate-buffer-state (state buffer-states)
+  "Update STATE with values from BUFFER-STATES.
+
+Returns non-nil if any state was changed."
+  (let ((any-changed nil))
+    (pcase-dolist (`(,path ,hook-idx ,value) buffer-states)
+      (when-let ((nested-state (lui--follow-key-path state path)))
+        (let ((hook (nth hook-idx (plist-get nested-state :hooks))))
+          (or (eq :use-buffer-state (car hook))
+              (error "Misplaced buffer state hook: %s %s" path hook-idx))
+          (unless (equal value (cadr hook))
+            (setf (cadr hook) value)
+            (setq any-changed t)))))
+    any-changed))
+
+(defun lui--use-buffer-state-callback (path hook-idx value)
+  "Set the buffer state VALUE for the hook at HOOK-IDX in component at PATH."
+  (let* ((root-state (or lui--modification-state
+                         (error "Called set-buffer-state outside of a ui callback")))
+         (nested-state (lui--follow-key-path root-state path))
+         (hooks (plist-get nested-state :hooks))
+         (hook (nth hook-idx hooks)))
+    (setf (cadr hook) value)))
+
+(defun lui--use-buffer-state (initial)
+  "Create a buffer state hook with INITIAL value.
+
+Buffer state is preserved in the undo history.
+Returns a cons of (VALUE . SETTER-FUNCTION)."
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         (hook-idx (plist-get ctx :hook-idx))
+         (path (plist-get ctx :path))
+         (hook (lui--register-hook ctx :use-buffer-state initial))
+         (value (cadr hook)))
+    (cons value (lambda (value) (lui--use-buffer-state-callback path hook-idx value)))))
+
+
+;;;; Use effect
+
+(defun lui--run-effects (state &optional key-path)
+  "Run all pending use-effect hooks in STATE and its children.
+
+KEY-PATH is the current path in the component tree."
+  ;; Run effects for sub elements
+  (let ((children (plist-get state :content)))
+    (when (listp children)
+      (dolist (child children)
+        (lui--run-effects (cdr child) (append key-path (list (car child)))))))
+  ;; Run effects for the current element
+  (dolist (hook (plist-get state :hooks))
+    (when (and (eq (car hook) :use-effect)
+               (nth 3 hook))
+      (funcall (cadr hook)))))
+
+(defun lui--use-effect (dependencies effect)
+  "Define a use-effect hook.
+
+The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
+values of the dependencies. 3. Whether the callback should be called on
+this particular render.
+
+The 3rd parameter is t if this is the first render, or if the
+dependencies changed since the last render."
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         (hook (lui--register-hook ctx :use-effect
+                 effect (not dependencies) t)))
+
+    ;; Set the callback to the new callback
+    (setf (cadr hook) effect)
+    ;; Check if the dependencies have changed
+    (if (equal dependencies (caddr hook))
+        (setf (nth 3 hook) nil)
+      (setf (caddr hook) dependencies)
+      (setf (nth 3 hook) t))))
+
+
+;;;; Use memo
+
+(defun lui--use-memo (dependencies generator)
+  "Store a memoized value.
+
+GENERATOR is a 1-argument function which takes the old value and
+generates a new value. DEPENDENCIES is a list of values. The memo will
+be rerun when one of DEPENDENCIES changes."
+  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
+         (hook (lui--register-hook ctx :use-memo
+                 generator dependencies (funcall generator nil))))
+
+    ;; Set the generator to the new generator
+    (setf (cadr hook) generator)
+    ;; Check if the dependencies have changed
+    (unless (equal dependencies (caddr hook))
+      (setf (caddr hook) dependencies)
+      (setf (nth 3 hook) (funcall generator (nth 3 hook))))
+    (nth 3 hook)))
+
+
+;;;; Use text properties
+
+(defun lui--use-text-properties (properties)
+  "Set additional text properties for the entire region."
+  (let ((ctx (or lui--generate-ui-ctx (error "No containing lens context"))))
+    (lui--use-effect
+     (random)
+     (lambda ()
+       (save-excursion
+         (pcase-let ((`(,start . ,end) (lui-find-ctx ctx))
+                     (ps properties)
+                     (prop nil) (value nil))
+           (lens-silent-edit
+            (while ps
+              (setq prop (pop ps) value (pop ps))
+              (pcase prop
+                ('face (add-face-text-property start end value t))
+                ('keymap
+                 (alter-text-property
+                  start end 'keymap
+                  (lambda (existing)
+                    ;; If the keymap is already in the existing, do nothing
+                    (cond ((or (eq existing value) (memq value (cdr existing))) existing)
+                          ;; If the existing is already a list of keymaps, prepend
+                          ((and (keymapp existing) (ignore-errors (seq-every-p #'keymapp (cdr existing))))
+                           `(keymap ,@(cdr existing) value))
+                          ;; If there is already a keymap, create one combining the two
+                          (existing (list 'keymap existing value))
+                          (value)))))
+                (_ (put-text-property start end prop value)))))))))))
+
+
 ;;; ============================================================
 ;;; Ui
 ;;;; Generating
-
-(defvar lui--generate-ui-ctx nil)
 
 (defun lui--generate-ui (elem path old-state root-state)
   "Generate the UI for a component.
@@ -415,7 +810,7 @@ Creates an intermediate ui-generation context which is a plist containing:
     first time, or a subsequent time.
   :path - The key path to the current level
   :hook-idx - How many hooks have been processed in the current level
-  :unique-id - A symbol containing the ui id and path"
+  :id - A symbol containing the ui id and path"
 
   (let* ((state (or old-state (and (null path) root-state)
                     (list :hooks nil :content nil)))
@@ -478,7 +873,7 @@ This is for the purpose of calculating diffs between ui states."
 Each row has the form ((PATH ELEMENT STATE-HOOKS) . TEXT).
 
 This format is designed to be suitable for diffing, as used in
-`lens--ui-rerender'."
+`lui-rerender'."
   (let* ((content (plist-get state :content))
          (element (plist-get state :element))
          (renderer (plist-get state :renderer)))
@@ -504,11 +899,11 @@ This format is designed to be suitable for diffing, as used in
   "Briefly highlight the sections of the lens that are rerendered.")
 
 
-(defun lui-renderer (state old-rows he _fb)
+(defun lui-rerender (state old-rows he _fb)
   (let* ((new-rows (lui--string-rows state nil))
          (diff (lui-diff-lists old-rows new-rows)))
 
-    (lens-save-position-in-ui
+    (lui-save-position-in-ui
      (goto-char (1+ he))
      ;; Apply each diff element
      (pcase-dolist (`(,action (,key-path) ,_old_str ,new-str) (append diff (list nil)))
@@ -539,7 +934,7 @@ This format is designed to be suitable for diffing, as used in
 
 (defun lui-modify (state callback args)
   "Call CALLBACK with ARGS, updating the ui associated with STATE."
-  (if lui--callback-state
+  (if lui--modification-state
       (apply callback args)
 
     ;; This is the root-level callback, so we need to handle updating the lens
@@ -567,24 +962,23 @@ This format is designed to be suitable for diffing, as used in
           (lui--generate-ui (plist-get state :ui-func) nil
                             state state))
 
-        (let ((lui--callback-state state))
+        (let ((lui--modification-state state))
           (apply callback args))
 
         (lui--generate-ui (plist-get state :ui-func) nil
                           state state)
 
         (lens-modify region (cons state (lui--collect-buffer-states state nil)) nil
-                     (lambda (he fb) (lui-renderer state old-rows he fb)))
+                     (lambda (he fb) (lui-rerender state old-rows he fb)))
 
-        (lens--ui-run-effects state)
+        (lui--run-effects state)
 
-        (when lui-focused
-          (plist-put lui-focused :last-point (point)))))))
+        (when lui-focused (plist-put lui-focused :last-point (point)))))))
 
 
 ;;;; Ui display
 
-(defun lens-ui-display (ui-func)
+(defun lui-display (ui-func)
   "Display spec for custom ui definitions.
 
 UI is a function which takes a ui context and returns a list of
@@ -636,16 +1030,16 @@ hook among all hooks in the current component."
           :totext (lambda (state) (plist-get state :text))
           :insert
           (lambda (state)
-            (run-with-timer 0 nil #'lens--ui-run-effects (car state))
+            (run-with-timer 0 nil #'lui--run-effects (car state))
             (concat (propertize "\n" 'lens-element-key 'START)
                     (lui--state-to-string (car state)))))))
 
 
 ;;;; Defui
 
-(defvar lens-ui-alist nil)
+(defvar lui-ui-alist nil)
 
-(defmacro lens-ui-body (&rest body)
+(defmacro lui-component-body (&rest body)
   `(lui-let-body
     [(:use-callback
        lambda (body name &rest cb)
@@ -667,7 +1061,7 @@ hook among all hooks in the current component."
       lambda (body state-var set-var initial)
       (unless (symbolp state-var) (error "First argument to :use-buffer-state must be a variable symbol"))
       (unless (symbolp set-var) (error "Second argument to :use-buffer-state must be a function symbol"))
-      `((let* ((=use-state= (lens--use-buffer-state ,initial))
+      `((let* ((=use-state= (lui--use-buffer-state ,initial))
                (,state-var (car =use-state=))
                (,set-var (cdr =use-state=)))
           (cl-flet ((,set-var ,set-var))
@@ -676,16 +1070,16 @@ hook among all hooks in the current component."
       lambda (body var deps &rest cb-body)
       (unless (symbolp var) (error "First argument to :use-memo must be a variable symbol"))
       (unless (vectorp deps) (error "Second argument to :use-memo must be a dependency vector"))
-      `((let ((,var (lens--use-memo (list ,@deps ,@nil) (lambda (,var) (ignore ,var) ,@cb-body))))
+      `((let ((,var (lui--use-memo (list ,@deps ,@nil) (lambda (,var) (ignore ,var) ,@cb-body))))
           ,@body)))
      (:use-effect
       lambda (body deps &rest cb-body)
       (unless (vectorp deps) (error "First argument to :use-effect must be a dependency vector"))
-      `((lens--use-effect (list ,@deps ,@nil) (lambda () ,@cb-body))
+      `((lui--use-effect (list ,@deps ,@nil) (lambda () ,@cb-body))
         ,@body))
      (:use-text-properties
       lambda (body &rest properties)
-      `((lens--use-text-properties ,(cons #'list properties))
+      `((lui--use-text-properties ,(cons #'list properties))
         ,@body))
      (:use-renderer
       lambda (body ctx renderer)
@@ -699,371 +1093,8 @@ hook among all hooks in the current component."
 
 (defmacro lens-defui (name arglist &rest body)
   (declare (indent 2))
-  `(setf (alist-get ',name lens-ui-alist)
-         (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name))))
-
-
-;;; ============================================================
-;;; Hooks
-;;;; Hook helper macro
-
-(defmacro lui--register-hook (ctx type &rest args)
-  (declare (indent 2))
-  `(let* ((state (plist-get ctx :state))
-          (hooks (plist-get state :hooks))
-          (hook-idx (plist-get ctx :hook-idx))
-          hook)
-
-     (if (plist-get ,ctx :is-first-call)
-         ;; Add a hook to the hooks list
-         (progn (cl-assert (eq (length hooks) hook-idx))
-                (setq hook (list ,type ,@args))
-                (plist-put state :hooks (nconc hooks (list hook))))
-       ;; Check if the indexed hook has the correct type
-       (setq hook (nth hook-idx hooks))
-       (unless hook (error "Called %s hook where no hook was previously" ,type))
-       (unless (eq (car hook) ,type)
-         (error "Called %s hook where %s hook was previously" ,type (car hook))))
-     (plist-put ctx :hook-idx (1+ hook-idx))
-     hook))
-
-
-;;;; Use focusable
-
-(defvar-local lui-focused nil
-  "The currently focused element in the current buffer.
-
-This is nil, or a plist representing the current focused element.
-
-The plist has the following internally managed properties:
-  :element - A cons cell (STATE . PATH) representing the current element.
-  :last-point - The position of the cursor after the previous command.
-  :location - A cons cell (START . END) representing the last known
-    start end end position of the focused element.
-
-It also can have any of the following properties specified by the
-use-focusable hook:
-  :update - A function called every time the cursor moves while the
-    element is focused. If it returns nil, then unfocus the element. If
-    this property is omited, then the element will be immediately
-    unfocused every time it is focused.
-  :on-focus - Function called when focusing.
-  :on-unfocus - Function called when unfocusing.
-  :render - If non-nil, rerender the element when focused/unfocused.
-
-All functions are called with one argument, which is the value of
-`lui-focused'.")
-
-(defun lui--focused-post-command ()
-  (if (null lui-focused) (lui-unfocus)
-
-    (let ((element (plist-get lui-focused :element)))
-      (plist-put lui-focused :location
-                 (lui-find-element (car element) (cdr element)))
-      (let* ((fn (or (plist-get lui-focused :update) #'ignore))
-             (stay-focused (with-demoted-errors "Error fixing focus: %s"
-                             (funcall fn lui-focused))))
-        (if stay-focused
-            (plist-put lui-focused :last-point (point))
-          (lui-unfocus))))))
-
-(cl-defun lui--use-focusable (&rest plist)
-  "Make the current element focusable.
-
-See `lui-focused' for a list of valid properties for PLIST."
-
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         hook)
-
-    ;; Ensure that there are no other :use-focusable hooks
-    (and (plist-get ctx :is-first-call)
-         (cl-loop for (hook-type) in (plist-get (plist-get ctx :state) :hooks)
-                  thereis (eq hook-type :use-focusable))
-         (error "You can only have one :use-focusable hook per element"))
-
-    (setq hook (lui--register-hook ctx :use-focusable nil))
-    (setf (cddr hook) plist)
-
-    ;; Set the first argument to be whether it is focused
-    (setf (cadr hook)
-          (when lui-focused
-            (let ((elem (plist-get lui-focused :element)))
-              (and (eq (car elem) (plist-get ctx :root-state))
-                   (equal (cdr elem) (plist-get ctx :path))))))
-    (cadr hook)))
-
-(defun lui--perform-focus-change (element focus unfocus)
-  (let ((fn #'(lambda (focus unfocus)
-                (when-let ((on-focus (plist-get focus :on-focus)))
-                  (with-demoted-errors "Error in focus: %s"
-                    (funcall on-focus focus)))
-                (when-let ((on-unfocus (plist-get unfocus :on-unfocus)))
-                  (with-demoted-errors "Error in unfocus: %s"
-                    (funcall on-unfocus unfocus))))))
-
-    (if (or (plist-get focus :render) (plist-get unfocus :render))
-        (lui-modify (car element) fn (list focus unfocus))
-      (funcall fn focus unfocus))))
-
-(defun lui-unfocus ()
-  "Unfocus the focused element."
-  (interactive)
-  (let ((old lui-focused))
-    (setq lui-focused nil)
-    (remove-hook 'post-command-hook lui--focused-post-command t)
-    (when old (lui--perform-focus-change (plist-get old :element) nil old))))
-
-(defun lui-focus (ctx &rest relative-path)
-  "Focus the element at RELATIVE-PATH relative to CTX.
-
-For example, if RELATIVE-PATH is nil, this will focus the current
-element. If RELATIVE-PATH is (:a) it will focus the child with key :a.
-The element being focused must have a :use-focusable hook."
-  (let* ((path (append (plist-get ctx :path) relative-path))
-         (elem-state (or (lui--follow-key-path (plist-get ctx :state) relative-path)
-                         (error "Unable to focus element %s: Not found" path)))
-         (hook (or (cl-loop for (hook-type) in (plist-get elem-state :hooks)
-                            thereis (eq hook-type :use-focusable))
-                   (error "Unable to focus element %s: Not focusable" path)))
-         (plist (cddr hook))
-         (element (cons (plist-get ctx :root-state) path))
-         (old-focused lui-focused)
-         (old-element (plist-get old-focused :element))
-         new-focused)
-
-    (unless (equal element old-element)
-      (setq new-focused
-            (apply #'list
-                   :element element
-                   :last-point (point)
-                   :location (lui-find-element (car element) (cdr element))
-                   plist))
-
-      (setq lui-focused (when (plist-get plist :update) new-focused))
-      (if lui-focused
-          (add-hook 'post-command-hook lui--focused-post-command nil t)
-        (remove-hook 'post-command-hook lui--focused-post-command t))
-
-      (if (eq (car element) (car old-element))
-          ;; different path in same state -- perform a single focus change for both
-          (lui--perform-focus-change element new-focused old-focused)
-        ;; old state != new state -- perform an unfocus then a focus
-        (when old-element (lui--perform-focus-change old-element nil old-focused))
-        (lui--perform-focus-change element new-focused nil)))))
-
-
-;;;; Use callback
-
-(defvar lui--callback-state nil
-  "A copy of the root-level state of the ui, which should be mutated.")
-
-(defun lui--use-callback (name cb)
-  "Register a :use-callback hook.
-
-\(:use-callback NAME CALLBACK SYMBOL)
-
-Where SYMBOL is a custom symbol whose function value is set to call this
-hook. This function returns SYMBOL."
-
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         (root-state (plist-get ctx :root-state))
-         (ui-id (plist-get root-state :ui-id))
-         (path (plist-get ctx :path))
-         (hook
-          (lui--register-hook ctx :use-callback
-                              name cb
-                              (let* ((str (cl-loop for sym in path
-                                                   concat (symbol-name sym) into str
-                                                   finally return (format "lens-%s%s:%s" ui-id str name)))
-                                     (ret-symbol (make-symbol str)))
-                                (fset ret-symbol
-                                      `(lambda (&rest args)
-                                         (interactive)
-                                         (lui--perform-callback ',root-state ',path ',name args)))
-                                ret-symbol))))
-    (setf (caddr hook) cb)
-    (nth 3 hook)))
-
-(defun lui--follow-key-path (state path)
-  (if (null path) state
-    (lui--follow-key-path
-     (or (alist-get (car path) (plist-get state :content))
-         (error "Invalid component key path"))
-     (cdr path))))
-
-(defun lui--perform-callback (state path name args)
-  "Perform a named callback.
-
-STATE is the root ui state. PATH is the path to the component containing
-the callback. NAME is the name of the callback."
-
-  ;; Find the correct function to call
-  (let* ((nested-state (lui--follow-key-path state path))
-         (hook (or (cl-loop for (htype hname) in (plist-get nested-state :hooks)
-                            thereis (and (eq htype :use-callback) (eq hname name)))
-                   (error "Callback not found %s %s" path name))))
-
-    ;; If this is a callback called from within another callback
-    (lui-modify state (caddr hook) args)))
-
-
-;;;; Use state
-
-(defun lui--use-state-callback (path hook-idx value)
-  (let* ((root-state (or lui--callback-state
-                         (error "Called set-state outside of a ui callback")))
-         (nested-state (lui--follow-key-path root-state path))
-         (hooks (plist-get nested-state :hooks))
-         (hook (nth hook-idx hooks)))
-    (setf (cadr hook) value)))
-
-(defun lui--use-state (initial)
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         (hook-idx (plist-get ctx :hook-idx))
-         (path (plist-get ctx :path))
-         (hook (lui--register-hook ctx :use-state initial))
-         (value (cadr hook)))
-    (cons value (lambda (value) (lui--use-state-callback path hook-idx value)))))
-
-
-;;;; Use buffer state
-
-(defun lui--collect-buffer-states (state path)
-  (nconc (cl-loop for hook in (plist-get state :hooks)
-                  for hook-idx from 0
-                  when (eq (car hook) :use-buffer-state)
-                  collect (list path hook-idx (copy-tree (cadr hook))))
-         (when (listp (plist-get state :content))
-           (cl-loop for (key . child) in (plist-get state :content)
-                    nconc (lui--collect-buffer-states child (append path (list key)))))))
-
-(defun lui--propogate-buffer-state (state buffer-states)
-  "Update STATE with values from BUFFER-STATES.
-
-Returns non-nil if any state was changed."
-  (let ((any-changed nil))
-    (pcase-dolist (`(,path ,hook-idx ,value) buffer-states)
-      (when-let ((nested-state (lui--follow-key-path state path)))
-        (let ((hook (nth hook-idx (plist-get nested-state :hooks))))
-          (or (eq :use-buffer-state (car hook))
-              (error "Misplaced buffer state hook: %s %s" path hook-idx))
-          (unless (equal value (cadr hook))
-            (setf (cadr hook) value)
-            (setq any-changed t)))))
-    any-changed))
-
-(defun lens--use-buffer-state-callback (path hook-idx value)
-  "Set the buffer state VALUE for the hook at HOOK-IDX in component at PATH."
-  (let* ((root-state (or lui--callback-state
-                         (error "Called set-buffer-state outside of a ui callback")))
-         (nested-state (lui--follow-key-path root-state path))
-         (hooks (plist-get nested-state :hooks))
-         (hook (nth hook-idx hooks)))
-    (setf (cadr hook) value)))
-
-(defun lens--use-buffer-state (initial)
-  "Create a buffer state hook with INITIAL value.
-
-Buffer state is preserved in the undo history.
-Returns a cons of (VALUE . SETTER-FUNCTION)."
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         (hook-idx (plist-get ctx :hook-idx))
-         (path (plist-get ctx :path))
-         (hook (lui--register-hook ctx :use-buffer-state initial))
-         (value (cadr hook)))
-    (cons value (lambda (value) (lens--use-buffer-state-callback path hook-idx value)))))
-
-
-;;;; Use effect
-
-(defun lens--ui-run-effects (state &optional key-path)
-  "Run all pending use-effect hooks in STATE and its children.
-
-KEY-PATH is the current path in the component tree."
-  ;; Run effects for sub elements
-  (let ((children (plist-get state :content)))
-    (when (listp children)
-      (dolist (child children)
-        (lens--ui-run-effects (cdr child) (append key-path (list (car child)))))))
-  ;; Run effects for the current element
-  (dolist (hook (plist-get state :hooks))
-    (when (and (eq (car hook) :use-effect)
-               (nth 3 hook))
-      (funcall (cadr hook)))))
-
-(defun lens--use-effect (dependencies effect)
-  "Define a use-effect hook.
-
-The :use-effect hook has 3 parameters: 1. The callback. 2. The list of
-values of the dependencies. 3. Whether the callback should be called on
-this particular render.
-
-The 3rd parameter is t if this is the first render, or if the
-dependencies changed since the last render."
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         (hook (lui--register-hook ctx :use-effect
-                                   effect (not dependencies) t)))
-
-    ;; Set the callback to the new callback
-    (setf (cadr hook) effect)
-    ;; Check if the dependencies have changed
-    (if (equal dependencies (caddr hook))
-        (setf (nth 3 hook) nil)
-      (setf (caddr hook) dependencies)
-      (setf (nth 3 hook) t))))
-
-
-;;;; Use memo
-
-(defun lens--use-memo (dependencies generator)
-  "Store a memoized value.
-
-GENERATOR is a 1-argument function which takes the old value and
-generates a new value. DEPENDENCIES is a list of values. The memo will
-be rerun when one of DEPENDENCIES changes."
-  (let* ((ctx (or lui--generate-ui-ctx (error "No containing lens context")))
-         (hook (lui--register-hook ctx :use-memo
-                                   generator dependencies (funcall generator nil))))
-
-    ;; Set the generator to the new generator
-    (setf (cadr hook) generator)
-    ;; Check if the dependencies have changed
-    (unless (equal dependencies (caddr hook))
-      (setf (caddr hook) dependencies)
-      (setf (nth 3 hook) (funcall generator (nth 3 hook))))
-    (nth 3 hook)))
-
-
-;;;; Use text properties
-
-(defun lens--use-text-properties (properties)
-  "Set additional text properties for the entire region."
-  (let ((ctx (or lui--generate-ui-ctx (error "No containing lens context"))))
-    (lens--use-effect
-     (random)
-     (lambda ()
-       (save-excursion
-         (pcase-let ((`(,start . ,end) (lui-find-ctx ctx))
-                     (ps properties)
-                     (prop nil) (value nil))
-           (lens-silent-edit
-            (while ps
-              (setq prop (pop ps) value (pop ps))
-              (pcase prop
-                ('face (add-face-text-property start end value t))
-                ('keymap
-                 (alter-text-property
-                  start end 'keymap
-                  (lambda (existing)
-                    ;; If the keymap is already in the existing, do nothing
-                    (cond ((or (eq existing value) (memq value (cdr existing))) existing)
-                          ;; If the existing is already a list of keymaps, prepend
-                          ((and (keymapp existing) (ignore-errors (seq-every-p #'keymapp (cdr existing))))
-                           `(keymap ,@(cdr existing) value))
-                          ;; If there is already a keymap, create one combining the two
-                          (existing (list 'keymap existing value))
-                          (value)))))
-                (_ (put-text-property start end prop value)))))))))))
+  `(setf (alist-get ',name lui-ui-alist)
+         (lambda ,@(cl--transform-lambda (list arglist (cons #'lui-component-body body)) name))))
 
 
 ;;; ============================================================
@@ -1081,7 +1112,7 @@ be rerun when one of DEPENDENCIES changes."
 
     (apply #'list #'prog1
            `(put ',name 'lens-component
-                 (lambda ,@(cl--transform-lambda (list arglist (cons #'lens-ui-body body)) name)))
+                 (lambda ,@(cl--transform-lambda (list arglist (cons #'lui-component-body body)) name)))
            (cl-loop for (prop . value) in props
                     for sym-name = (concat "lens-component-" (substring (symbol-name prop) 1))
                     collect `(put ',name ',(intern sym-name) ,value)))))
@@ -1101,22 +1132,6 @@ be rerun when one of DEPENDENCIES changes."
 
 ;;;; Button
 
-(defface lens-button '((t :inherit custom-button))
-  "Face for lens buttons.")
-
-(defvar lens-button-map
-  (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "<return>") #'lens-click)
-    m)
-  "Keymap local to buttons.")
-
-(defun lens-click ()
-  "If there is a ui button at point, call its onclick function."
-  (interactive)
-  (let ((click (get-text-property (point) 'lens-click)))
-    (if click (funcall click)
-      (error "Nothing to click"))))
-
 (lens-defcomponent button (_ctx label onclick &key face)
   :can-be-column t
   (propertize (format " %s " label)
@@ -1129,7 +1144,7 @@ be rerun when one of DEPENDENCIES changes."
 
 ;;;; Columns
 
-(defun lens--join-columns (cols &optional sep)
+(defun lui--join-columns (cols &optional sep)
   "Vertically align a list of strings as columns.
 
 COLS is the list of strings to align, and SEP is an additional
@@ -1156,7 +1171,7 @@ string to insert between the columns."
     (unless (get (car elem) 'lens-component-can-be-column)
       (error "Invalid column component: %s" (car elem))))
 
-  (:use-renderer ctx (lambda (cols) (lens--join-columns cols (propertize " " 'read-only t))))
+  (:use-renderer ctx (lambda (cols) (lui--join-columns cols (propertize " " 'read-only t))))
   columns)
 
 (lens-defcomponent rows (_ctx &rest rows)
@@ -1193,9 +1208,9 @@ string to insert between the columns."
   (:use-focusable focused?
                   :render t
                   :info (list unique-id)
-                  :update #'lens--border-box-update-cursor
-                  :on-focus (lambda (_) (run-hook-with-args 'lens-box-enter-hook))
-                  :on-unfocus (lambda (_) (run-hook-with-args 'lens-box-exit-hook)))
+                  :update #'lui--text-box-update-cursor
+                  :on-focus (lambda (_) (run-hook-with-args 'lui-text-box-enter-hook))
+                  :on-unfocus (lambda (_) (run-hook-with-args 'lui-text-box-exit-hook)))
 
   ;; The real value to use for the cursor
   (setq cursor (when focused? (min (or cursor (length text)) (length text))))
@@ -1224,7 +1239,7 @@ string to insert between the columns."
 
   (:use-callback
     change-cb (newtext newcursor line-idx)
-    (let ((res (lens--border-box-callback body line-idx newtext newcursor)))
+    (let ((res (lui--text-box-callback body line-idx newtext newcursor)))
       (funcall set-text (car res))
       (set-cursor (cdr res))))
 
@@ -1250,17 +1265,17 @@ string to insert between the columns."
           (list footer))
    (propertize "\n" 'read-only t)))
 
-(defcustom lens-box-enter-hook nil
+(defcustom lui-text-box-enter-hook nil
   "Hook run after entering a box."
-  :group 'lens
+  :group 'lui
   :type 'hook)
 
-(defcustom lens-box-exit-hook nil
+(defcustom lui-text-box-exit-hook nil
   "Hook run after exiting a box."
-  :group 'lens
+  :group 'lui
   :type 'hook)
 
-(cl-defun lens--border-box-update-cursor ((&key info last-point &allow-other-keys))
+(cl-defun lui--text-box-update-cursor ((&key info last-point &allow-other-keys))
   (let ((cur-line (line-number-at-pos))
         (unique-id (car info)))
 
@@ -1288,7 +1303,7 @@ string to insert between the columns."
           (message "Press ESC to exit the textbox")
           t))))
 
-(defun lens--border-box-callback (body line-idx new-line-text cursor-col)
+(defun lui--text-box-callback (body line-idx new-line-text cursor-col)
   "Process a modification to a border box.
 
 BODY is the list of lines, LINE-IDX is the modified line index,
@@ -1319,6 +1334,28 @@ Returns (NEW-CONTENT . NEW-CURSOR)."
         (setq new-content (concat new-content line))))
 
     (cons new-content new-cursor)))
+
+
+;;; ============================================================
+;;; Inserting
+
+(defun lui-read-ui (&optional prompt)
+  "Prompt the user to select a UI from `lui-ui-alist'.
+
+PROMPT is the prompt string to display."
+  (let ((name (completing-read (or prompt "Ui: ") (mapcar #'car lui-ui-alist))))
+    (alist-get (intern name) lui-ui-alist)))
+
+(defun lui-insert-ui (beg end ui)
+  "Create a lens displaying UI, replacing region from BEG to END."
+  (interactive (list (point) (if mark-active (mark) (point)) (lui-read-ui)))
+  (lens--replace-create beg end #'lens-replace-source (lui-display ui)))
+
+(defun lui-insert-buffer-ui (beg end buffer ui)
+  "Create a lens displaying BUFFER with UI, replacing region from BEG to END."
+  (interactive (list (point) (if mark-active (mark) (point))
+                     (read-buffer "Buffer: ") (lui-read-ui)))
+  (lens--replace-create beg end (lambda (str) (lens-buffer-source buffer str)) (lui-display ui)))
 
 
 ;;; ============================================================

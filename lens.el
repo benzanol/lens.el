@@ -53,35 +53,6 @@ redisplay will be cancelled.")
      (forward-line (1- line))
      (forward-char (min col (- (pos-eol) (point))))))
 
-(defmacro lens-save-position-in-ui (&rest body)
-  "Save the current position relative to the containing ui element."
-  `(let ((line (line-number-at-pos)) (col (current-column))
-         me ui-key ui-line region)
-     (save-excursion
-       (and
-        ;; Find the prop match at the end of the component
-        (setq me (text-property-search-forward 'lens-element-key))
-        ;; If the next prop match is a start, then we weren't inside of an element
-        (not (eq (prop-match-value me) 'START))
-        ;; Go to the prop match at the beginning of the component
-        (progn (forward-char -1)
-               (text-property-search-backward 'lens-element-key))
-        ;; We are inside of a component, so set the relevant values
-        (setq ui-line (- line (line-number-at-pos))
-              ui-key (prop-match-value me))))
-     ,@body
-     (if (and ui-key (setq region (lens-at-point))
-              (progn (goto-char (caddr region)) ; Go to the end of the lens header
-                     ;; Go to the end of the key region
-                     (text-property-search-forward 'lens-element-key ui-key #'equal))
-              ;; Go to the beginning of the key region
-              (progn (forward-char -1) (text-property-search-backward 'lens-element-key)))
-         (progn (forward-line ui-line)
-                (forward-char (min col (- (pos-eol) (point)))))
-       (goto-char (point-min))
-       (forward-line (1- line))
-       (forward-char (min col (- (pos-eol) (point)))))))
-
 (defun lens--refresh-buffer (&optional beg end)
   "Called after modifying a buffer region between BEG and END."
 
@@ -284,7 +255,8 @@ the field."
   (push (list :buffer (current-buffer)
               :pos (set-marker (make-marker) beg)
               ;; If it was modified by an undo action, mark it as such
-              :undo (when (cl-loop for frame in (backtrace-frames) thereis (eq (cadr it) #'primitive-undo)) t))
+              :undo (cl-loop for frame in (backtrace-frames)
+                             thereis (eq (cadr it) #'primitive-undo)))
         lens--modified-fields)
   (add-hook 'post-command-hook #'lens--field-modification-callback))
 
@@ -328,6 +300,25 @@ the previous command, as described in `lens--field'."
                (lens--refresh-buffer hb fe)))))))))
 
 
+;;;; Buttons
+
+(defface lens-button '((t :inherit custom-button))
+  "Face for lens buttons.")
+
+(defvar lens-button-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "<return>") #'lens-click)
+    m)
+  "Keymap local to buttons.")
+
+(defun lens-click ()
+  "If there is a ui button at point, call its onclick function."
+  (interactive)
+  (let ((click (get-text-property (point) 'lens-click)))
+    (if click (funcall click)
+      (error "Nothing to click"))))
+
+
 ;;; ============================================================
 ;;; Lens Lifecycle
 ;;;; Creating
@@ -347,7 +338,7 @@ end-lens properties, the header and footer contain a random
 number. This ensures that the undo system knows that it has
 changed, ensuring that it stores the new lens value."
   (cl-destructuring-bind
-      (&key ((:head-props hps)) ((:foot-props fps)) ((:head-face hf)) ((:foot-face ff)))
+      (&key ((:head-props hps)) ((:foot-props fps)) ((:head-face hf)) ((:foot-face ff)) &allow-other-keys)
       (get (car lens) :style)
     (let* ((rand (format "%05d" (random 99999)))
            (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
@@ -475,13 +466,15 @@ face, as it will trample all other faces in the region."
 (defun lens-modify (region new &optional external norefresh)
   "Update the lens currently at REGION with the new data NEW.
 
-EXTERNAL specifies if the new value provided was a new text
-value, rather than a new state value. In this case, don't call
-the update function (the new text is already saved).
+EXTERNAL specifies if the modification came from the lens (internal) or
+source (external). For internal modifications, NEW is interpreted as the
+new state value, whereas for external modificaiton, it is interpreted as
+the new text value. For external modifications, don't call the update
+function, as the source already has the updated data.
 
 If NOREFRESH is t, only the header and footer should be reinserted. If
-NOREFRESH is a (lambda (OLDSTATE NEWSTATE HE FB)), then use that
-function to reinsert the lens content."
+NOREFRESH is a function with arguments (OLDSTATE NEWSTATE HE FB), then
+use that function to reinsert the lens content."
 
   (pcase-let* ((`((,spec ,oldtext ,oldstate) ,hb ,he ,fb ,fe) region)
                (display (get spec :display))
