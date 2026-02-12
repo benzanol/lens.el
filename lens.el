@@ -137,22 +137,14 @@ following the same convention as `text-property-search-forward'."
 The bounds of the region are specified by BEG-PROP and END-PROP,
 as described by `lens--region-search-forward'."
   (let* ((cursor-sensor-inhibit t)
-         (start (point))
-         (hb nil) (he nil)
-         (pred (lambda (_nil val)
-                 (and val
-                      ;; Check if the previous region of BEG-PROP
-                      ;; matches the value of END-PROP
-                      (setq he (previous-single-property-change (1+ (point)) beg-prop))
-                      (setq hb (or (previous-single-property-change he beg-prop) (point-min)))
-                      (<= hb start)
-                      (eq (get-text-property hb beg-prop) val))))
-         ;; Search forward for values of END-PROP, and at each match,
-         ;; check if it is the end of a region containing the point
-         (end-match (save-excursion (text-property-search-forward end-prop nil pred))))
-    (when end-match
-      (list (prop-match-value end-match) hb he
-            (prop-match-beginning end-match) (prop-match-end end-match)))))
+         beg-match end-match)
+    (save-excursion
+      (and (setq end-match (text-property-search-forward end-prop))
+           (setq beg-match (text-property-search-backward beg-prop))
+           (eq (prop-match-value end-match) (prop-match-value beg-match))
+           (list (prop-match-value end-match)
+                 (prop-match-beginning beg-match) (prop-match-end beg-match)
+                 (prop-match-beginning end-match) (prop-match-end end-match))))))
 
 
 (defun lens-search-forward (&optional val pred)
@@ -256,7 +248,7 @@ the field."
               :pos (set-marker (make-marker) beg)
               ;; If it was modified by an undo action, mark it as such
               :undo (cl-loop for frame in (backtrace-frames)
-                             thereis (eq (cadr it) #'primitive-undo)))
+                             thereis (eq (cadr frame) #'primitive-undo)))
         lens--modified-fields)
   (add-hook 'post-command-hook #'lens--field-modification-callback))
 
