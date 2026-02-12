@@ -923,25 +923,25 @@ This format is designed to be suitable for diffing, as used in
 
 (defun lui-rerender (state old-rows he _fb)
   (let* ((new-rows (lui--string-rows state nil))
-         (diff (lui-diff-lists old-rows new-rows)))
+         (diff (lui-diff-lists old-rows new-rows))
+         new-fb)
 
     (lui-save-position-in-ui
      (goto-char (1+ he))
      ;; Apply each diff element
-     (pcase-dolist (`(,action (,key-path) ,_old_str ,new-str) (append diff (list nil)))
+     (pcase-dolist (`(,action (,key-path) ,_old_str ,new-str) diff)
        (let ((start (point)) match)
-         ;; The last pass through is just to record the end positions of the last element
-         (when action
-           (if (eq action :insert)
-               (progn (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
-                      (when lui-debug
-                        (let ((ol (make-overlay start (point))))
-                          (overlay-put ol 'face 'lui-rerender-highlight))))
-             ;; The match is the newline at the end of the old element
-             (setq match (text-property-search-forward 'lens-element-key))
-             (cl-assert match)
-             (cl-assert (equal (prop-match-value match) key-path))
-             (when (eq action :delete) (delete-region start (point))))))))
+         (if (eq action :insert)
+             (progn (insert new-str (propertize "\n" 'read-only t 'lens-element-key key-path))
+                    (when lui-debug
+                      (let ((ol (make-overlay start (point))))
+                        (overlay-put ol 'face 'lui-rerender-highlight))))
+           ;; The match is the newline at the end of the old element
+           (setq match (text-property-search-forward 'lens-element-key))
+           (cl-assert match)
+           (cl-assert (equal (prop-match-value match) key-path))
+           (when (eq action :delete) (delete-region start (point))))))
+     (setq new-fb (point)))
 
     (when lui-debug
       (run-with-timer
@@ -949,7 +949,9 @@ This format is designed to be suitable for diffing, as used in
        #'(lambda (buf)
            (with-current-buffer buf
              (remove-overlays nil nil 'face 'lui-rerender-highlight)))
-       (current-buffer)))))
+       (current-buffer)))
+
+    new-fb))
 
 
 ;;;; Modify

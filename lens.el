@@ -137,10 +137,12 @@ following the same convention as `text-property-search-forward'."
 The bounds of the region are specified by BEG-PROP and END-PROP,
 as described by `lens--region-search-forward'."
   (let* ((cursor-sensor-inhibit t)
+         (start (point))
          beg-match end-match)
     (save-excursion
       (and (setq end-match (text-property-search-forward end-prop))
            (setq beg-match (text-property-search-backward beg-prop))
+           (>= start (prop-match-beginning beg-match))
            (eq (prop-match-value end-match) (prop-match-value beg-match))
            (list (prop-match-value end-match)
                  (prop-match-beginning beg-match) (prop-match-end beg-match)
@@ -336,7 +338,7 @@ changed, ensuring that it stores the new lens value."
            (title (funcall (or (plist-get (get (car lens) :source) :title) #'ignore)))
            (h-text (format "[%s] %s" rand (or title "")))
            (h (apply #'propertize h-text 'lens-begin lens 'read-only t hps))
-           (f (apply #'propertize (format "[%s]\n" rand) 'lens-end lens 'read-only t fps)))
+           (f (apply #'propertize (format "<%s>\n" rand) 'lens-end lens 'read-only t fps)))
       ;; Add the head-face and foot-face specified in the style
       (lens--append-face 0 (length h) hf h)
       (lens--append-face 0 (length f) ff f)
@@ -344,7 +346,10 @@ changed, ensuring that it stores the new lens value."
       (cons (lens--make-sticky h) (lens--make-sticky f)))))
 
 (defun lens--generate-insert-text (lens)
-  "Generate the full insert string for LENS."
+  "Generate the full insert string for LENS.
+
+Returns (HEADER BODY FOOTER). These can be concatenated to get the full
+string."
 
   (let* ((insert-fn (plist-get (get (car lens) :display) :insert))
          ;; Catch display errors if `lens-catch-display-errors' is non-nil
@@ -365,7 +370,7 @@ changed, ensuring that it stores the new lens value."
     (add-text-properties 1 (length inside) (plist-get style :props) inside)
     (lens--append-face 1 (length inside) (plist-get style :face) inside)
 
-    (concat (car hs) inside (cdr hs))))
+    (list (car hs) inside (cdr hs))))
 
 (defun lens-create (source display &optional style)
   "Insert a new lens into the current buffer.
@@ -435,7 +440,7 @@ face, as it will trample all other faces in the region."
          (state (funcall (plist-get display :tostate) text))
          (lens (list spec text state))
 
-         (insert (lens--generate-insert-text lens)))
+         (insert (apply #'concat (lens--generate-insert-text lens))))
 
     (lens-silent-edit (insert insert))
 
@@ -476,7 +481,8 @@ use that function to reinsert the lens content."
                (`(,newtext ,newstate)
                 (if external (list new (funcall (plist-get display :tostate) new))
                   (list (funcall (plist-get display :totext) new) new)))
-               (newlens (list spec newtext newstate)))
+               (newlens (list spec newtext newstate))
+               (new-he) (new-fb))
 
     ;; If nothing was changed, then leave the current lens as is.
     ;; Replacing the lens when it hasn't changed can lead to issues
@@ -485,29 +491,30 @@ use that function to reinsert the lens content."
                  (string= oldtext newtext)
                  (equal oldstate newstate))
       (lens-silent-edit
-       ;; Refresh the style properties
-       (add-text-properties (1+ he) fb (plist-get (get spec :style) :props))
-       (lens--append-face (1+ he) fb (plist-get (get spec :style) :face))
-
        (if norefresh
            ;; Reinsert only the header and footer
            (let ((strs (lens--generate-headers newlens)))
              (save-excursion (goto-char fb) (delete-region fb fe) (insert (cdr strs))
                              (lens--refresh-buffer fb (point)))
              (save-excursion (goto-char hb) (delete-region hb he) (insert (car strs))
+                             (setq new-he (point))
+                             (setq new-fb (+ fb (- new-he he)))
                              (lens--refresh-buffer hb (point)))
              (when (functionp norefresh)
-               (funcall norefresh he fb)))
+               (setq new-fb (funcall norefresh he fb))))
 
          ;; Reinsert the entire lens
-         (let ((insert (lens--generate-insert-text newlens)))
+         (cl-destructuring-bind (htext btext ftext) (lens--generate-insert-text newlens)
            (lens-save-position
             (delete-region hb fe)
-            (insert insert)
-            ;; Go back to the start of the lens so that
-            ;; lens-save-position-in-ui recognizes the current lens
-            (goto-char hb)
-            (lens--refresh-buffer hb (point))))))
+            (setq new-he (+ (point) (length htext)))
+            (setq new-fb (+ new-he (length btext)))
+            (insert htext btext ftext)
+            (lens--refresh-buffer hb (point)))))
+
+       ;; Refresh the style properties
+       (add-text-properties (1+ new-he) new-fb (plist-get (get spec :style) :props))
+       (lens--append-face (1+ new-he) new-fb (plist-get (get spec :style) :face)))
 
       ;; Update the data source if this was a direct modification to the lens
       (unless external (funcall (plist-get source :update) newtext)))))
@@ -929,15 +936,16 @@ all overlays."
 (defface lens-box-underline '((t :underline (:color "lightskyblue4")))
   "Face for lens box underline.")
 
-(defface lens-box-body '((t :background "gray20" :extend t))
+(defface lens-box-body '((t :extend t))
   "Face for lens box body.")
 (defface lens-box-head '((t :inherit (lens-box-body lens-box-overline fixed-pitch)
-                            :height 0.9 :foreground "steelblue" :weight bold))
+                            :height 0.9 :foreground "#79A1C4" :weight bold))
   "Face for lens box head.")
-(defface lens-box-foot '((t :inherit (lens-box-body lens-box-underline fixed-pitch) :height 1.0))
+(defface lens-box-foot '((t :inherit (lens-box-body lens-box-underline fixed-pitch) :height 0.5
+                            :foreground "#79A1C4"))
   "Face for lens box foot.")
 
-(defface lens-box-vert '((t :background "lightskyblue4"))
+(defface lens-box-vert '((t :background "#79A1C4"))
   "Face for lens box vertical line.")
 (defface lens-box-padding '((t :inherit lens-box-body))
   "Face for lens box padding.")
@@ -969,16 +977,17 @@ all overlays."
 (defvar lens-header-map
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "SPC") #'lens-fold-toggle)
+    (define-key m (kbd "<backspace>") #'lens-remove)
     m)
   "Map local to the lens header and footer.")
 
 (defvar lens-box-style
-  (list :props (list 'bz/line-prefix lens-line-prefix 'bz/wrap-prefix lens-line-prefix)
+  (list :props (list 'line-prefix lens-line-prefix 'wrap-prefix lens-line-prefix)
         :face 'lens-box-body
-        :head-props (list 'bz/line-prefix lens-head-prefix 'bz/wrap-prefix lens-head-prefix
-                          'local-map lens-header-map 'keymap lens-header-map)
+        :head-props (list 'line-prefix lens-head-prefix 'wrap-prefix lens-head-prefix
+                          'keymap lens-header-map)
         :head-face 'lens-box-head
-        :foot-props (list 'bz/line-prefix lens-foot-prefix 'bz/wrap-prefix lens-foot-prefix)
+        :foot-props (list 'line-prefix lens-foot-prefix 'wrap-prefix lens-foot-prefix 'display "\n")
         :foot-face 'lens-box-foot)
   "Style plist for rendering lenses as bordered boxes.")
 
