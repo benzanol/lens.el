@@ -55,3 +55,6 @@ stop
 @enduml
 #+end_src
 
+#+RESULTS:
+[[file:resources/flowchart.png]]
+
