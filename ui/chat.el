@@ -3,8 +3,6 @@
 (require 'dash)
 
 
-(setq vec nil)
-
 (bz/face lens-chat-user :bg bg :x t)
 (bz/face lens-chat-ai :bg bg3 :x t)
 (bz/face lens-chat-header :h 0.5 :w bold :fg gray1)
@@ -18,38 +16,38 @@
   (:use-state history set-history nil)
 
   (:use-callback
-    stream-cb (output)
-    (let ((first (car history)))
-      (setf (cadr first) (concat (cadr first) output))
-      (set-history history)))
+   stream-cb (output)
+   (let ((first (car history)))
+     (setf (cadr first) (concat (cadr first) output))
+     (set-history history)))
 
   (:use-callback
-    send-cb ()
-    (set-input "")
-    (set-history (cons (list input "") history))
+   send-cb ()
+   (set-input "")
+   (set-history (cons (list input "") history))
 
-    (streaming-llm-request
-     "openai/gpt-4.1-mini" input (reverse history)
-     (streaming-llm--batch-callback
-      (lambda (output)
-        (unless (eq output 'done)
-          (funcall stream-cb output)))
-      0.05)))
+   (streaming-llm-request
+    "openai/gpt-4.1-mini" input (reverse history)
+    (streaming-llm--batch-callback
+     (lambda (output)
+       (unless (eq output 'done)
+         (funcall stream-cb output)))
+     0.05)))
 
-  (:use-callback focus-field () (lens-ui-focus ctx :input))
-  (:use-memo keymap [] `(keymap (return . ,focus-field)))
+  (:use-memo keymap [] `(keymap (return . ,(lambda () (interactive) (lui-focus ctx :input)))))
   (:use-text-properties 'keymap keymap)
 
   (:use-memo field-props [] `(keymap (keymap (return . ,send-cb))))
 
-  `((string :space "a")
-    ,@(--map-indexed
-       (list 'string (intern (format ":chat-%s" it-index))
-             (concat (propertize (concat (car it) "\n") 'face 'lens-chat-user) "\n"
-                     (propertize (concat "" "\n") 'face '(lens-chat-ai lens-chat-header))
-                     (propertize (concat (cadr it) "\n") 'face 'lens-chat-ai)
-                     (propertize "\n" 'face '(lens-chat-ai lens-chat-footer))))
-       (reverse history))
+  `((string :space " ")
+    ,@(cl-loop for (user ai) in (reverse history)
+               for i upfrom 0
+               collect
+               (list 'string (intern (format ":chat-%s" i))
+                     (concat (propertize (concat user "\n") 'face 'lens-chat-user) "\n"
+                             (propertize (concat "" "\n") 'face '(lens-chat-ai lens-chat-header))
+                             (propertize (concat ai "\n") 'face 'lens-chat-ai)
+                             (propertize "\n" 'face '(lens-chat-ai lens-chat-footer)))))
 
     (text-field :input ,input ,set-input :props ,field-props)
     ;; (text-box :input ,input ,set-input :onenter ,send-cb :width 50)
@@ -67,24 +65,24 @@
                            :box-props '(face shadow)))
 
   (:use-callback
-    stream-cb (output)
-    (let ((first (car history)))
-      (setf (cadr first) (concat (cadr first) output))
-      (setf (nth 3 first) (make-box "AI" (cadr first)))
-      (set-history history)))
+   stream-cb (output)
+   (let ((first (car history)))
+     (setf (cadr first) (concat (cadr first) output))
+     (setf (nth 3 first) (make-box "AI" (cadr first)))
+     (set-history history)))
 
   (:use-callback
-    send-cb ()
-    (set-input "")
-    (set-history (cons (list input "" (make-box "User" input) (make-box "AI" "...")) history))
+   send-cb ()
+   (set-input "")
+   (set-history (cons (list input "" (make-box "User" input) (make-box "AI" "...")) history))
 
-    (streaming-llm-request
-     "openai/gpt-4.1-mini" input (reverse history)
-     (streaming-llm--batch-callback
-      (lambda (output)
-        (unless (eq output 'done)
-          (funcall stream-cb output)))
-      0.05)))
+   (streaming-llm-request
+    "openai/gpt-4.1-mini" input (reverse history)
+    (streaming-llm--batch-callback
+     (lambda (output)
+       (unless (eq output 'done)
+         (funcall stream-cb output)))
+     0.05)))
 
 
   `(,@(--map-indexed

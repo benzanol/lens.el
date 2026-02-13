@@ -21,7 +21,7 @@
 
 If any of body is (LET-KEYWORD VAR VAL), then this will be compiled to a
 let expression containing the rest of the body. LET-KEYWORD can be any
-of `:let', `:flet', `:when-let', `:pcase-let', or `:-let'.
+of `:let', `:flet', `:when-let', or `:pcase-let'.
 
 So,
   (:let a 4)
@@ -58,8 +58,7 @@ This allows for the following syntax:
   (let ((let-keywords '((:let . let)
                         (:flet . cl-flet)
                         (:when-let . when-let)
-                        (:pcase-let . pcase-let)
-                        (:-let . -let)))
+                        (:pcase-let . pcase-let)))
         (custom (when (vectorp (car body)) (append (pop body) nil)))
         exprs func lets)
     ;; Go through the expressions in reverse

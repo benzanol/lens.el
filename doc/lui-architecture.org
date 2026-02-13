@@ -1,0 +1,75 @@
+* UML Flow Diagram
+#+begin_src plantuml :file resources/lens-lifecycle-flow.png :exports results
+@startuml
+skinparam shadowing false
+
+actor User
+participant Lens
+participant Source
+participant Display
+participant "Lens Buffer" as Buffer
+
+== Creation ==
+User -> Lens: lens-create(source, display)
+activate Lens
+Lens -> Source: :init()
+Source --> Lens: text
+Lens -> Display: :tostate(text)
+Display --> Lens: state
+Lens -> Display: :insert(state)
+Display --> Lens: body
+Lens -> Buffer: Insert header + body + footer
+deactivate Lens
+
+== Internal Modification ==
+User -> Buffer: Interaction with lens (edit text, click button, etc...)
+Buffer -> Lens: lens-modify(lens, new-state, internal)
+activate Lens
+Lens -> Display: :totext(new-state)
+Display --> Lens: new-text
+Lens -> Display: :insert(new-state)
+Display --> Lens: new-body
+Lens -> Buffer: Replace lens region
+Lens -> Source: :update(new-text)
+deactivate Lens
+
+== External Modification ==
+User -> Source: Modification to source (buffer, file, network, etc)
+Source -> Lens: lens-modify(lens, new-text, external)
+activate Lens
+Lens -> Display: :tostate(new-text)
+Display --> Lens: new-state
+Lens -> Display: :insert(new-state)
+Display --> Lens: new-insert
+Lens -> Buffer: Replace lens region
+note right: Do not update source based on new state,\npreventing loop
+deactivate Lens
+
+== Removal ==
+User -> Lens: lens-remove
+activate Lens
+Lens -> Source: :replace(text)
+Source --> Lens: replacement-text
+Lens -> Buffer: Delete lens, insert replacement
+deactivate Lens
+
+== Save ==
+User -> Buffer: save-buffer
+Buffer -> Lens: before-save-hook
+activate Lens
+Lens -> Source: :replace(text)
+Source --> Lens: replacement-text
+Lens -> Buffer: Delete lens, insert replacement
+deactivate Lens
+Buffer -> Buffer: Save buffer (with lens removed)
+Buffer -> Lens: after-save-hook
+activate Lens
+Lens -> Buffer: Reinsert lens
+Lens -> Source: :save(text)
+
+@enduml
+#+end_src
+
+#+RESULTS:
+[[file:resources/lens-lifecycle-flow.png]]
+

@@ -1,0 +1,159 @@
+#+TITLE: Lui Documentation
+
+=lui.el= (Lens UI) extends =lens.el= with a React-like component system for building interactive user interfaces in Emacs.
+
+Key features:
+- Declarative component-based UI
+- React-style hooks (useState, useEffect, useMemo, etc.)
+- Partial rerendering
+- Focus management for interactive elements
+- Undo-aware state management
+
+* Defining uis
+
+Components are functions that generate UI content. They receive a context and return either:
+- A string (leaf content)
+- A list of child components
+
+** UI Function
+For defining a top-level ui, use =lens-defui=.
+
+#+begin_src elisp
+(lens-defui my-ui (_ctx)
+  (list '(my-component :first "arg1" "arg2")
+        '(my-component :second "arg3" "arg4")))
+#+end_src
+
+The ui is a function which takes as argument a rendering context (which will be unused most of the time,) and returns a list of component calls.
+
+Each component call is a list =(COMPONENT :KEY ARGS...)=. The =:KEY= argument indicates a unique key for the child, and cannot be duplicated (within the same component.) This allows for each rendered component to be identified by a unique list of keys, called a key path, which can be used to traverse the component tree.
+
+** Defining Components
+
+#+begin_src elisp
+(lens-defcomponent my-component (ctx arg1 arg2)
+  :can-be-column t
+
+  (:use-state value set-value 0)
+
+  (format "Value: %d" value))
+#+end_src
+
+A component function, similarly to a ui function, takes a rendering context as its first element. However, it can also take any number of subsequent arguments. The argument list for a component uses the same conventions as =cl-defun=, meaning that it allows for the =&key= and =&aux= specifiers in addition to the traditional emacs lisp ones.
+
+A component can either return a list of sub-components, just as a ui function, or it can return the exact string to render for the component.
+
+If the first element of the component body is a keyword, the beginning of the body will be parsed as a plist of properties to apply to the component. The following properties have special meanings:
+- =:can-be-column= - Indicates that the component can be used as a column in a =column= component. For example, the default multi-line text field cannot be used as a column, as it must be rendered in a contiguous region of the buffer.
+
+** Let body macro
+The body of ui functions and components are wrapped in the =lui-let-body= macro, which allows for creating many nested scopes without nested parenthesis.
+It is best explained through example. When the macro is applied,
+#+begin_src emacs-lisp
+  (:let x 5)
+  (* 2 x)
+#+end_src
+becomes
+#+begin_src emacs-lisp
+  (let ((x 5))
+    (* 2 x))
+#+end_src
+
+The macro also provides the built-in keywords =:when-let=, =:pcase-let=, and =:flet= (for =cl-flet=).
+
+For the purpose of let expressions, this macro seems superfluous, but when defining many hooks in a single function, each of which create a nested scope, it becomes critical for creating readable code.
+
+* Hooks
+Hooks provide state and lifecycle management within components. They must be called in the same order on every render.
+
+** :use-state
+The simplest and lowest overhead way to define state in luis through the =:use-state= hook. On the first render of a component, the state will be set to the initial value. =value-var= will be bound to the value of the state, and =set-value-var= will be bound to a function to the state update function.
+#+begin_src elisp
+  (:use-state value-var set-value-var 0)
+#+end_src
+
+The update function takes one argument, which is the new state value. It does not support taking a function as its argument like the ReactJS equivalent.
+Both the variable and function values of =set-value-var= will be bound, so both the syntaxes =(set-value-var 1)= and =(funcall set-value-var 1)= will work as expected.
+
+*IMPORTANT:* All set state calls must occur within a =:use-callback= callback.
+
+** :use-buffer-state
+One of the main goals of lui is to interface nicely with existing emacs features, such as the undo history. If you were to implement a text field with =:use-state=, and the user undid the changes they made to the text field, the content of the text present in the buffer would be out of sync with the ui state.
+The =:use-buffer-state= hook was designed for such purposes. Each time the state is updated, a snapshot is placed in the text properties of the buffer. Then, when you perform an undo, the snapshot will be restored, keeping the internal state in sync with the buffer.
+#+begin_src elisp
+  (:use-buffer-state text set-text "initial")
+#+end_src
+
+Keep in mind that this creates a copy of the state on every update, so there is a much heavier memory overhead than =:use-state=. Thus, this should only be used in cases where the ability to undo is desired.
+
+** :use-callback
+For a variety of reasons, all calls to set state functions must take place inside of a named "callback", defined using the =:use-callback= hook.
+#+begin_src elisp
+  (:use-state count set-count 0)
+  (:use-callback increment-count (&optional delta)
+                 (set-count (+ count (or delta 1))))
+  (:use-effect [] (run-with-timer 1 nil increment-count 5))
+  `((string :count ,(format "Count=%s" count))
+    (button :increment "Increment count" ,increment-count))
+#+end_src
+The =increment-count= symbol will be bound to an interactive function, which can then be used in buttons, keymaps, timers, or sent anywhere else in emacs, and still be expected to behave correctly.
+
+In the example above, suppose we instead passed around the function =(lambda () (set-count (1+ count)))=. If the user pressed the button before the timer finished, the count would increase to 1 as expected. However, when the timer triggers, it will increase the count to 5 (rather than the expected 6), since the closure passed to the timer would be referencing an outdated value of count. When calling a =:use-callback=, the function called is always the version of the callback generated on the most recent rerender, solving this issue. 
+
+** :use-effect
+The =:use-effect= hook allows you to run side effects after the render has finished. This can often be useful for adjusting the point to a particular location.
+#+begin_src elisp
+  (:use-state count set-count 0)
+  (:use-effect [count]
+               (lui-find-ctx ctx) ; Move the cursor to the current element
+               (message "Count changed to %d" count))
+#+end_src
+
+The first argument to a =:use-effect= hook is a vector of dependencies, which can be arbitrary lisp forms. The effect will run when any of the dependencies change (as determined by =#'equal=.) For example, to make the effect run only on the first render, use =[]=, and to make the effect run on every render, use =[(random)]=.
+
+** :use-memo
+The =:use-memo= hook allows you to avoid redoing expensive computations on every rerender.
+#+begin_src elisp
+(:use-memo result-var [input]
+           (compute-expensive input))
+#+end_src
+
+Similar to =:use-effect=, the body of the hook will only be rerun when any of the dependencies change. However, unlike effects (which are run after rerendering is complete,) the memo body will run as soon as the hook is called, storing the result of the computation in =result-var=.
+
+** :use-focusable
+The =:use-focusable= hook allows a component to receive and manage cursor focus within the Emacs buffer.
+#+begin_src elisp
+  (:use-focusable is-focused
+                  :update (lambda (ps) t)
+                  :on-focus (lambda (ps) (message "Element focused!"))
+                  :on-unfocus (lambda (ps) (message "Element unfocused!"))
+                  :render t)
+#+end_src
+
+The first argument is a variable which will be bound to =t= or =nil=, indicating whether the current element is actively focused. The remaining arguments are keyed properties allowing customization of the focus behavior.
+
+- =:update=: A function called after every command (cursor movement, etc.) while the element is focused. It must return a truthy value for the element to retain focus. If it returns =nil=, or if this property is omitted entirely, the element will unfocus.
+- =:on-focus=: A function triggered immediately when the element receives focus.
+- =:on-unfocus=: A function triggered immediately when the element loses focus.
+- =:render=: If set to a non-nil value, the component will automatically trigger a rerender whenever it is focused or unfocus.
+- =:info=: This argument allows passing additional information from the component body to each of the hooks.
+
+*Function Argument:* Each function property will be called with a single argument, a plist. The plist contains all properties passed to the =:use-focusable= hook (this is what makes the =:info= property useful,) as well as the following properties:
+- =:element= - A cons cell =(STATE . PATH)= which is the root ui state, along with the path to the focused component. This uniquely identifies the component.
+- =:last-point= - The position of the point before the previous command (this is especially useful in the =:update= function.)
+- =:state= - Reserved for each individual component to use as necessary. Allows the hooks to store any additional information persistently.
+
+** :use-text-properties
+The =:use-text-properties= hook provides a clean way to apply standard Emacs text properties to the entire text region occupied by the component.
+
+#+begin_src elisp
+  (:use-text-properties 'face 'bold
+                        'keymap my-custom-keymap
+                        'read-only t)
+#+end_src
+
+Under the hood, this uses an effect that runs after every render to confidently re-apply the properties to the rendered text. It includes merging logic for a couple of specific, commonly used properties to prevent conflicts:
+
+=face=: It applies faces using =add-face-text-property= (with the =APPEND= flag set to =t=). This means it adds to existing faces rather than aggressively overwriting them.
+
+=keymap=: It safely merges the provided keymap with any keymaps already present on the text. If a keymap or a list of keymaps already exists, it will construct a combined keymap, ensuring no previous bindings are accidentally clobbered. If both a parent and child element bind the same key, the child element will take precedence while the cursor is within the bounds of the child element.
